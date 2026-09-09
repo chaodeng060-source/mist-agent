@@ -36,8 +36,8 @@ import {
 } from "../../src/session/handover-letter.ts";
 import {
   type ActiveWindow,
-  type OpenOptions,
   type DispatchReceipt,
+  type OpenOptions,
   SessionRegistry,
 } from "../../src/session/session-registry.ts";
 import { type TurnGateEvent, ViewportTurnGate } from "../../src/session/turn-gate.ts";

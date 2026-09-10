@@ -190,3 +190,14 @@ active 插件的**整插件卸载**操作。它幂等；撤销不完整时进入
 
 **实证**
 验收清单里跑出来的结果。读过源码、看过文档、觉得「应该能」都不算实证。
+
+**history_search / SearchEpisode**
+住户侧的历史调查入口 / 宿主内部的一次有界调查。消费导航索引给出的候选，按当前权限
+回到原始记录，分别报告执行状态、覆盖范围、仪器状态和可空结论。持久化的是可观察的
+查询、尝试与回执，不是私有推理或第二份聊天史；跨 session 只能显式继续，预算不重置。
+Phase 0 图纸见 [history-search-phase-0.md](design/history-search-phase-0.md)。
+
+**source handle（历史调查）**
+可交给宿主 resolver 回源的身份把手，语义上绑定 source domain、权威记录身份、范围与
+版本/hash。它不是访问授权；每次解析重新过权限闸。索引的 path/line 是临时 locator，
+snippet/score 是找线索的材料，均不能单独充当证据。字段拼写随上游稳定接缝确定。

@@ -18,6 +18,6 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
-      # 报告模式：闭环建成前红灯是常态，只看板不拦门。
-      # 六绿之后把这行换成 acceptance:strict，红灯开始拦 merge。
-      - run: npm run acceptance
+      # 闭环已建成：第一里程碑自 2026-08-14 六盏真绿（STUBBED 已清、独立复验
+      # 已落章），按当日拍板「六绿后判卷转 strict」收口——灯变红即拦 merge。
+      - run: npm run acceptance:strict

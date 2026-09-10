@@ -27,7 +27,7 @@
 每条带主证据形式。标 [集成] 的测试真实启动宿主并可注入断线、猝死和重试；
 标 [协议/客户端] 的测试同时检查能力授权与第一方 read model。
 
-- [ ] **OS-01 两个 viewport 只长一条有序主流** [集成]：同一 resident 的 viewport A、
+- [x] **OS-01 两个 viewport 只长一条有序主流** [集成]：同一 resident 的 viewport A、
   B 并发产生两个合法事件；桌面与手机最终得到相同的 canonical `eventId` 集合和相同
   顺序。第三个客户端在两事件发生期间离线，重连后得到同一集合与顺序且无重复。
   测试交换 A、B 的到达次序重复运行；不要求某一 viewport 固定先赢，只要求主流 writer
@@ -35,23 +35,31 @@
   字节串或内容 hash，并让各投影带回其引用的同一份摘要；同一 `eventId` 的正文、来源与
   效果语义必须逐项等价，只有明确声明的投影层展示元数据可排除。保留相同 id/顺序却改了
   payload 仍判红。任一 viewport 的局部 transcript 都不得成为第二个权威源。
+  （2026-09-10 主笔授权勾：#133 已合 main；核验 host 双序 A/B 与 desktop/mobile/offline
+  三投影逐项等价、payloadHash 一致，core 保留同一 id/seq 篡改 payload 判
+  `ProjectionIntegrityError`；干净 worktree `npm test` 过；拔掉 projection 的
+  `verifyCanonicalEvent` 即专项转红。注：A/B 交替在同进程并发提交层验证，非 IPC 调度级竞争）
 
   证据：`tests/one-stream-host.test.ts` 通过真实子进程宿主交换 A/B 到达顺序，并核对 desktop、
   mobile、offline 三个投影的完整事件、顺序与 payload hash；`tests/one-stream-core.test.ts`
   保留同一 id/seq 后篡改 payload，投影校验会 fail-closed。
 
-- [ ] **OS-02 猝死重放至多入流一次，回执不冒充生效** [集成]：对同一投递分别在
+- [x] **OS-02 猝死重放至多入流一次，回执不冒充生效** [集成]：对同一投递分别在
   “生成后、主流写入前”和“主流写入后、回执前”杀死宿主，再恢复并重试。最终 canonical
   stream 中该投递恰有一条；同一幂等把手换内容重试必须拒绝。未取得真实入流回执时
   不得标为 delivered；仅 delivered 不得标为 committed-effective，也不得推进对应权威
   head。日志里的 attempted / started 不能充当任何一档成功回执。
+  （2026-09-10 主笔授权勾：#133 已合 main；核验两个真 SIGKILL checkpoint 恢复重试后恰
+  一条、`effect.state=attempted`，换内容重试 `IDEMPOTENCY_CONFLICT` 且 snapshot 字节不变；
+  忽略 `requestHash` 即专项转红。核验备注：承重断言是「恰一条 + effect.state=attempted」，
+  `receipt` 上两条 `not.toHaveProperty` 因 `DeliveryReceipt.phase` 只有 `delivered` 一值而近乎白过）
 
   证据：`tests/one-stream-host.test.ts` 在 generated-before-write 与
   durable-write-before-receipt 两个 checkpoint 杀死宿主后恢复重试，最终都恰一条；换内容
   重试被拒且 snapshot 字节不变，delivery receipt 也不产生 effect/head。
   `tests/one-stream-core.test.ts` 另证同进程双 writer 被拒、坏 snapshot 恢复 fail-closed。
 
-- [ ] **OS-03 归档流水只进证据面，不长成第二条聊天史** [协议/客户端]：活工作区可从
+- [x] **OS-03 归档流水只进证据面，不长成第二条聊天史** [协议/客户端]：活工作区可从
   first-party workspace navigator 进入；关闭后其活动入口消失，canonical stream 留下
   typed closure/result card 与权威产物指针。测试夹具声明两种调用主体：默认 P1 用户主体
   （无 evidence/control 授权）和显式获授权的证据主体，不锁最终权限名。viewport 关闭后，
@@ -60,6 +68,10 @@
   不暴露。对证据主体断言：只能沿 closure/result 的权威指针读到与该归档 viewport 绑定的
   只读流水，不能续聊或写回。`session.create` 的成功回执是工作区已存在，不是“创建了一条
   新聊天”。这四项由协议响应和 first-party read model 的结构化结果判定，不靠肉眼看 UI。
+  （2026-09-10 主笔授权勾：#139 已合 main；核验 first-party 快照无 archive/history/resume、
+  关窗后活动项消失、伪造同形 principal 判 `WorkspaceCapabilityError`、reader 无 write/resume；
+  证据权改按 capability 字符串放行即专项转红。`EvidenceAuthority` 按私有 WeakSet 的对象身份
+  判权，`capability` 字段只是标签）
 
   证据：`FirstPartyResidentView` 只投影 canonical stream 与仍活着的 workspace handle，接口不含
   archive/history/resume；`WorkspaceLifecycleOwner` 先写 durable closure request，再归档窗，
@@ -76,25 +88,30 @@
   generation 1 关闭、同窗合法重开 generation 2、closure-delivered 后宿主死亡、全量重建并
   reconcile 的链路，证明 journal replay 不会拿旧代 archive 冒充当前代。
 
-- [ ] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
+- [x] **OS-04 有界投递不夹带局部 transcript** [集成]：progress、blocked、result 三类
   合法 envelope 各投一次，来源 viewport、发生时刻、工作把手、权威产物指针与效果状态
   可核，三条均进入 canonical stream。随后在同类 payload 中夹带局部 transcript、消息数组
   或未声明的上下文正文，必被拒绝且主流字节不变；无类型自由文本同样不得借投递接口入流。
   来源字段只提供 provenance，不自动赋予 authority。
+  （2026-09-10 主笔授权勾：#137 已合 main；核验三类 envelope 入流、七种非法输入拒收且
+  snapshot 字节不变、authority source 由宿主注入；拔掉 envelope exact-key 闸即专项转红）
 
   证据：`BoundedWorkEventPort` 是 viewport 面唯一的三类投递口；来源窗只能提交固定
   envelope，authority source 由宿主组装时注入，不由窗自报。`tests/one-stream-host.test.ts`
   启动真实子进程，逐类投递 progress / blocked / result，并核对三条进入同一本 durable
-  canonical stream；随后分别夹带 transcript、messages、context、伪造 authority source，
-  以及直接提交无类型字符串，五种输入均被拒且 snapshot 字节不变。临时移除 envelope
-  exact-key 闸时，专项稳定转红（非法 transcript 成为第 4 条事件）。
+  canonical stream；随后分别夹带顶层 transcript、messages、context、伪造 authority source、
+  直接提交无类型字符串，外加 `source`/`effect` 内的嵌套夹带，七种输入均被拒且 snapshot
+  字节不变。临时移除 envelope exact-key 闸时，专项稳定转红（非法 transcript 成为第 4 条事件）。
 
-- [ ] **OS-05 宿主失败必须外显且明确未生效** [集成]：模拟一次由宿主执行的生命周期
+- [x] **OS-05 宿主失败必须外显且明确未生效** [集成]：模拟一次由宿主执行的生命周期
   动作失败（至少覆盖换气失败）。canonical stream 必须收到宿主签发的 typed user-visible
   event，明确动作未生效；受影响 viewport 是 subject，不是 reporter。若宿主会自动重试，
   事件不得伪装成需要用户处理的 blocker；若确需用户决策，则必须明确给出所需动作。
   只有日志、没有主流事件判红。失败后的下一次阈值穿越必须重新产生预告或尝试，不得因
   上一周期发过而静默。本条的换气判据与 [MV-D09](./multi-viewport.md) 共用，不另造第二套。
+  （2026-09-10 主笔授权勾：#138 已合 main；核验 append 失败→`automatic` 且不需人、swap
+  失败→`awaiting-external` 且 action 非空、失败后下一次穿越重新预告两发；只留本地 notice、
+  不写主流即专项转红）
 
   证据：`HostLifecycleFailurePort` 只接受宿主装配口给出的换气失败封套，签发
   `purpose=lifecycle` 的 canonical event；宿主是 reporter，受影响 viewport 是 subject，
@@ -105,11 +122,14 @@
   只有 notice、删掉主流写入，或把需人处理压成自动重试时专项稳定转红。
   `tests/one-stream-lifecycle.test.ts` 另证需人捞窗时动作文字必填，viewport 不能自签为 host。
 
-- [ ] **OS-06 用户回话按把手路由，歧义时不猜** [集成]：两个工作区同时产生需要回答的
+- [x] **OS-06 用户回话按把手路由，歧义时不猜** [集成]：两个工作区同时产生需要回答的
   blocked 事件。带 `replyToEventId` / `workRef` 的两次回复分别到达对应工作区；只有一个
   活候选时，裸回复可以确定路由；同时存在两个候选时，裸回复必须返回显式消歧要求，两个
   工作区均不得收到该回复。按最近事件、当前焦点、viewport 创建时间或模型推测偷偷分配，
   任一种都判红。
+  （2026-09-10 主笔授权勾：#140 已合 main；核验裸回复双候选返回 `disambiguation-required`
+  且树与 head 零写入、显式把手精确路由、余唯一候选后裸回复可达、未知/冲突/失效/失败均不旁落；
+  解析层只放行 `residentId`/`text`/`replyToEventId`/`workRef` 四个键，两候选偷猜第一个即专项转红）
 
   证据：`BlockedReplyRouter` 的候选集只来自 canonical stream 中仍需回答的 blocked event 与
   SessionRegistry 当前活代；输入面只有 `replyToEventId`、`workRef` 或裸回复，没有 recent、
@@ -129,7 +149,8 @@
 
 ## 变绿条件
 
-本页合入只代表判卷程序已写清，六盏默认保持未勾。实现 PR 必须给出相应的可重复测试，
+本页合入只代表判卷程序已写清，六盏默认保持未勾（起始状态；2026-09-10 主笔授权勾后
+六灯已点亮，逐条附注写明证据与拔闸结果）。实现 PR 必须给出相应的可重复测试，
 并在真实主流存储、宿主故障注入和第一方 read model 上取证；用 mock 直接返回期望对象，
 或只核日志文字，不足以把灯点绿。与 #66 C2、MV-D09 已有判据重叠的地方共用断言来源，
 不复制一套日后会漂移的成功语义。

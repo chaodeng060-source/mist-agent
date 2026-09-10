@@ -167,7 +167,7 @@
   事件片段进（必须精确回源）；摘要仅权威 typed record 条件进，索引自产摘要
   不进。三、字段级验收等 #120 稳定接缝；现在只出图纸。边界：`baoer_signal_grep`
   可做内容检索前门，不替代 canonical source；path/line 只是临时 locator。
-  施工单 #151（09-10 单 B）。代价：多一层投影要维护一致性回执；索引挂了只能
+  施工单 #150（09-10 单 B）。代价：多一层投影要维护一致性回执；索引挂了只能
   降级导航。来源：#131 全楼 + 主笔 2026-09-10 拍板。
 - 2026-09-10　**D16 主笔拍板：#144 history_search / SearchEpisode——三问收口，
   只开 Phase 0 图纸**。一、对住户叫 `history_search`，内部叫 `SearchEpisode`；

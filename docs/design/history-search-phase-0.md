@@ -19,9 +19,9 @@ Phase 0 只覆盖 canonical stream / window history / handoff 三种逻辑视图
 权威底座和证据面，不另造原文库。项目工作区后接；邮件等例子只说明通用身份语义，
 不是首期 source adapter。window history 的局部 transcript 仍是证据，不升级成主流消息。
 
-导航索引的当前工单是 [#151](https://github.com/mist-agent-harness/mist-agent/issues/151)，
-不是 #150（[#131 编号更正](https://github.com/mist-agent-harness/mist-agent/issues/131#issuecomment-5612143030)）。
-#151 管“原文可能在哪”：可重建 projection、候选 handle、分页和召回回执；本单管
+导航索引的正式工单是 [#150](https://github.com/mist-agent-harness/mist-agent/issues/150)
+（[#131 最终指针](https://github.com/mist-agent-harness/mist-agent/issues/131#issuecomment-5612163491)；重复单 #151 已关闭）。
+#150 管“原文可能在哪”：可重建 projection、候选 handle、分页和召回回执；本单管
 “怎么查、证据够不够、何时停”。索引不能宣布事实确认，本单不能另开绕过索引和宿主
 边界的内容搜索后门。`baoer_signal_grep` 可作内容检索前门，不充当 canonical source。
 
@@ -152,7 +152,7 @@ cursor 必须绑定原查询和候选 snapshot；过期须显式报告，另起�
 | #84 canonical stream | [event-contract.ts](../../src/one-stream/event-contract.ts) 的 eventId / streamSeq / payloadHash、authoritySource / origin；[writer.ts](../../src/one-stream/writer.ts) 唯一写方 | actor 元数据不自动等于用户原话身份；搜索 ACL、source adapter、episode 有界写入尚需接线 |
 | #120 window history | [WH-01–06](../../acceptance/window-history.md) 已有全未勾选规格；[workspace-read-model.ts](../../src/one-stream/workspace-read-model.ts) 的 EvidenceViewportReader 经 canonical result pointer 读证据面 | 不等同于生产 MistWindowHistoryPort 已持久化；稳定寻址、分页、故障与跨进程恢复仍由 #120 判卷，不能绕过证据面权限 |
 | #81 handoff | [handover-letters.ts](../../src/one-stream/handover-letters.ts) 沿同一 stream 按标题回源，区分 found / not-found / unavailable | 标题导航不自动证明用户原话；搜索 resolver、权限刷新和统一 handle 契约待对齐 |
-| #151 导航索引 | Phase 0 已授权出图纸：可重建 projection、handle、召回回执 | 字段不在本单抢冻；服务不可用、候选截断、索引水位与 cursor 需独立适配验收 |
+| #150 导航索引 | Phase 0 已授权出图纸：可重建 projection、handle、召回回执 | 字段不在本单抢冻；服务不可用、候选截断、索引水位与 cursor 需独立适配验收 |
 
 实现单先把本页语义验收变成可执行红测试，再接 #120 的稳定契约；不以其他模块绿灯替
 本单点灯。质量评测同时看误确认、越权、真例确认率与不必要的人类接管；性能阈值从

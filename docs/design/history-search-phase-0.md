@@ -20,7 +20,7 @@ Phase 0 只覆盖 canonical stream / window history / handoff 三种逻辑视图
 不是首期 source adapter。window history 的局部 transcript 仍是证据，不升级成主流消息。
 
 导航索引的正式工单是 [#150](https://github.com/mist-agent-harness/mist-agent/issues/150)
-（[#131 最终指针](https://github.com/mist-agent-harness/mist-agent/issues/131#issuecomment-5612163491)；重复单 #151 已关闭）。
+（[#131 最终指针](https://github.com/mist-agent-harness/mist-agent/issues/131#issuecomment-5612163491)）。
 #150 管“原文可能在哪”：可重建 projection、候选 handle、分页和召回回执；本单管
 “怎么查、证据够不够、何时停”。索引不能宣布事实确认，本单不能另开绕过索引和宿主
 边界的内容搜索后门。`baoer_signal_grep` 可作内容检索前门，不充当 canonical source。

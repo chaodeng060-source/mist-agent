@@ -142,5 +142,88 @@ M 编号的文件、原行、替换行、工作目录、实际仓库测试命令
 - 数字：本页确为 A=5、B=3、C=7、D=11（含 D07b）、E=2，合计 28。
   H1、#78 标题与 #78 正文均已是 28 条，泳道 3 亦已列 MV-D01~D10（含 MV-D07b）；
   #78 已于 2026-09-10T06:31:07Z 关闭，此处不再有待订正项。
-- 最终落章仍需 #148 楼内明确指定独立验收席，再由该席审阅本表、复跑与署名。
-  本地施工、自审、CI、主笔授权勾、独立验收署名是不同事实。
+- 最终落章已于 2026-09-17 完成，见本页
+  [2026-09-17 独立验收落章（#148）](#2026-09-17-独立验收落章148)。
+  本地施工、自审、CI、主笔授权勾、独立验收署名仍是不同事实，此处不合并记账。
+
+## 2026-09-17 独立验收落章（#148）
+
+### 席位与授权
+
+- 独立验收席：**旦九（`sakisakisa-design`）**，由主笔口令于 2026-09-17 在 #148
+  楼内指定并授权署名（[issuecomment-5715867739](https://github.com/mist-agent-harness/mist-agent/issues/148#issuecomment-5715867739)）。
+- 该席**不是 #155 的核验施工者**（施工者为小卷 / Codex / `chaodeng060-source`），
+  满足 #148 楼内「非施工者」的独立性要求。
+- 本席复验结论原文见
+  [issuecomment-5715641791](https://github.com/mist-agent-harness/mist-agent/issues/148#issuecomment-5715641791)。
+
+### 落章 SHA 与实跑基线
+
+- **落章 SHA：`91befc1b73726c69a2325da630029bb2c2bb15f4`**（含 #170 的文档订正）。
+- **实跑基线：`0de6bd775e12b91ad342a2d80832fd368ccb9eed`**——本席 2026-09-17 的全量
+  复跑与 31 次拔闸重放都在该 SHA 上完成。
+- 两点之间的全部差异是 `acceptance/multi-viewport.md` 一个文件、3 增 4 删，即 #170
+  的两处文档订正；**未触及 `src/`、`tests/`、`webui/`、锁文件、28 条勾选状态与
+  变异附件**，`test` / `acceptance` 命令未改。故实跑结果在落章 SHA 上继承有效。
+- 明确不隐去：本席**没有在 `91befc1` 上重跑测试**，上述成绩是 `0de6bd7` 的实跑，
+  不冒充落章 SHA 上的新成绩。差异为 docs-only 是继承的唯一依据。
+- 运行环境：干净 worktree，**非 root 用户**，Node `v22.22.2`（小卷记 `v22.23.1`，
+  Cursor 记 `v22.14.0`，三者小版本不同，不隐去）。以 root 运行会有 10 条「落盘
+  失败」用例假红——`chmod 0o555` 拦不住 root，与被测代码无关。
+
+### 本席复验结果
+
+- 根 `vitest run`：**539 passed / 38 todo**（51 passed files / 3 skipped，共 54 文件），
+  与 #155 附件记录逐字一致。
+- `acceptance/run.ts`：**六盏真绿**（第一里程碑六条，不是 28 条的自动判卷）。
+- `biome check .` 退出 0；`tsc --noEmit` 退出 0；webui 按锁定 pnpm `11.7.0`
+  `--frozen-lockfile` 装齐。
+- **31 次拔闸全部重放**：按附件逐条 `before → after` 替换、跑所记 `command`、恢复、
+  再跑同一命令。**31/31 变异退出 1，31/31 恢复后退出 0，每次专项恰一个测试失败**；
+  含 webui 的 M30/M31。全部恢复后 `git diff HEAD` 为空。
+- 四条无变异证据的 claim 另行核源码：MV-A02 / MV-B02（`#active` / `#archived` 均以
+  `windowId` 为键，无住户级当前代际出口）、MV-C06（缺口判据是 `entry.seq >
+  row.ackedSeq`，两处时间戳用法都不在该路径上）、MV-E02（差距段已清零且明写
+  history 仍是 fixture）——四条成立。
+- 未发现新的假绿。MV-A04 的真假绿已由 #155 本轮找出并修掉，本席确认修正后的独立
+  字面量断言对同一变异真实转红。
+
+### 逐条落章结论
+
+| 范围 | 票 | 出处 |
+|---|---|---|
+| 26 条（28 条中除 MV-D06、MV-D07b） | **验收席通过** | 本席复验，见上 |
+| MV-D06、MV-D07b | **第三人补签通过** | Cursor 独立审，[issuecomment-5716036147](https://github.com/mist-agent-harness/mist-agent/issues/148#issuecomment-5716036147) |
+
+- MV-D06、MV-D07b 本席**回避**：D06 系本席在 #66 提出（`docs/design/multi-viewport.md:94`），
+  D07b 的分档探针依据本席 2026-08-27 的裁定，按「起草人不评自己的卷」不投可信票。
+- 主笔 2026-09-17 先出「豁免并记档」（[issuecomment-5715888167](https://github.com/mist-agent-harness/mist-agent/issues/148#issuecomment-5715888167)），
+  随后改口为**由 Cursor 做第三人补签**（[issuecomment-5715934790](https://github.com/mist-agent-harness/mist-agent/issues/148#issuecomment-5715934790)）；
+  以补签结论为准，豁免那条留作程序备用。两条的票不是本席投的，账记在补签人名下。
+- 第 6 节两处文档缺陷（MV-B03 事件名、「数字」段过时陈述）已由 **#170** 订正合入，
+  本席在 `91befc1` 上核过：B03 行现为 `dispatch / receipt / dropped`，与
+  `src/message-tree/service.ts:35` 的 `event: "dispatch" | "receipt" | "dropped"`
+  及调用点 `:219` / `:230` / `:248` 一致；全页无旧事件名残留。
+
+### 落章不改写的边界（照抄不动）
+
+- **MV-C02**：仓内无 push 通道，「丢全部推送」是 vacuous 成立；引入推送通道后必须重验。
+- **MV-D04**：计量口契约，不是端到端产品行为。
+- **MV-D07**：子进程内模拟窗死亡，不是 SIGKILL。
+- **MV-D10**：外部绑定是 fixture Map。
+- **MV-E01**：history 仍是 fixture，不替 #120 判卷。
+- M18 / M24 / M28 三次是装配变异，不冒充实现内部闸门。
+- 以上任何一条都不得因落章被改写成已完成的生产能力。
+
+### 落章同时记下的代价
+
+这 28 条**没有自动判卷程序**——`npm run acceptance` 跑的是第一里程碑六条。28 条的
+绿是「人读证据 + 一次性变异回执 + 本席一次性重放」，**不是可重复打灯，也没有回归
+闸**：此后改 `src/` 不会有任何东西提醒某一条退化了。落章锁定的是 `91befc1` 这一刻
+的事实，不是一条持续有效的保证。
+
+### 署名
+
+**旦九 / sakisakisa-design，独立验收席，2026-09-17。**
+26/28 本席认，MV-D06 / MV-D07b 由 Cursor 补签。#148 可关闭；D13 前置条件（multi-viewport
+独立复验落章）**已满足**，实现单可开——开单仍归主笔。

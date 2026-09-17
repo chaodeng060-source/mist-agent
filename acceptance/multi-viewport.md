@@ -102,7 +102,7 @@ M 编号的文件、原行、替换行、工作目录、实际仓库测试命令
 | MV-A05 | #85 / #98 | `tests/turn-gate-host.test.ts` 的 MV-A05：50 条历史、baseline=ackedSeq=50、无全史 gap、初始有效集一次性交付；通过。 | M05 ackedSeq 从 0 起，baseline 断言红。 |
 | MV-B01 | #86 / #88 | `tests/multi-viewport-host.test.ts`：两窗同代回执均有效，依次重开后各自旧代无效／新代有效，另一窗不被连坐；通过。 | M06 不验 generation，旧代回执断言红。 |
 | MV-B02 | #86 | `tests/session-registry.test.ts` 的 MV-B02：同住户两窗同时为 generation 1、2，实例无 `currentGeneration`；公开方法和索引静态核对通过。 | 无可摘运行闸；不为“不存在 API”伪造拔闸计数。 |
-| MV-B03 | #135 | `tests/dispatch-logging-host.test.ts`：issued / accepted / dropped 全部逐字段带 residentId、windowId、generation；通过。 | M07 日志 generation 缺失，三元组断言红。 |
+| MV-B03 | #135 | `tests/dispatch-logging-host.test.ts`：dispatch / receipt / dropped 全部逐字段带 residentId、windowId、generation；通过。 | M07 日志 generation 缺失，三元组断言红。 |
 | MV-C01 | #85 / #98；本轮补强 | `tests/turn-gate-host.test.ts` 的 C01/C02：明确 hold A 的 responder，确认仍在途后落 ruling；B 下一轮 prompt 带裁定并 ack；通过。 | M08 不注入 gap，B prompt 缺裁定而红。 |
 | MV-C02 | #98 | 与 C01 共用真实宿主拉取断言；通过现有 pull 路径。 | 仓内无 push 通道，“丢全部推送”仍是原注所说的 vacuous 条件；M08 不冒充真实 push 故障试验。引入 push 后须重验。 |
 | MV-C03 | #85 / #98 | `tests/turn-gate-host.test.ts` 的 MV-C03：unknown 时普通动作可过且有日志，裁定级动作拒绝；与零缺口区分；通过。 | M09 查询失败放行裁定级动作，reject 断言红。 |
@@ -140,8 +140,7 @@ M 编号的文件、原行、替换行、工作目录、实际仓库测试命令
   #139 的 first-party read model／证据能力面也已落地。已据源码订正文档，仍保留
   history fixture、生产持久化和产品面验收之间的界线。
 - 数字：本页确为 A=5、B=3、C=7、D=11（含 D07b）、E=2，合计 28。
-  当前 H1 与 #78 **标题已经是 28**，不重复改成另一版；#78 正文仍写“25 条”，
-  且 D 泳道仍只列 D01～D08，须更新为“28 条”及“D01～D10（含 D07b）”。
-  本地记录不冒充 GitHub 已修改。
+  H1、#78 标题与 #78 正文均已是 28 条，泳道 3 亦已列 MV-D01~D10（含 MV-D07b）；
+  #78 已于 2026-09-10T06:31:07Z 关闭，此处不再有待订正项。
 - 最终落章仍需 #148 楼内明确指定独立验收席，再由该席审阅本表、复跑与署名。
   本地施工、自审、CI、主笔授权勾、独立验收署名是不同事实。

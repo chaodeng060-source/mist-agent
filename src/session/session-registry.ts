@@ -111,6 +111,18 @@ export interface SessionRegistryOptions {
   // Both journals are single-writer and must be backed up/restored together.
 }
 
+export interface WindowOpenListenerFailure {
+  readonly listenerId: string;
+  readonly windowId: string;
+  readonly generation: number;
+  readonly error: string;
+}
+
+export type WindowOpenedEvent = Pick<
+  ActiveWindow<unknown>,
+  "residentId" | "windowId" | "scopeId" | "scopeGeneration" | "generation"
+>;
+
 interface ArchivedWindowRecord {
   schemaVersion: 1 | 2;
   type: "window_archived";
@@ -209,6 +221,10 @@ export class SessionRegistry<TContext> {
   /** Only outstanding host-issued dispatches live here; event logging belongs to the host. */
   readonly #pendingDispatches = new Map<string, DispatchReceipt>();
   readonly #settlements = new WeakMap<object, DispatchReceipt>();
+  readonly #activityOrdinal = new Map<string, number>();
+  #activitySeq = 0;
+  readonly #windowOpenListeners = new Map<string, (window: Readonly<WindowOpenedEvent>) => void>();
+  readonly #windowOpenListenerFailures: WindowOpenListenerFailure[] = [];
   /** 上一枚 ULID 的时间戳与随机段——同毫秒连开多窗时自增随机段保单调。 */
   #ulidTimestamp = 0;
   #ulidRandom: number[] = [];
@@ -427,6 +443,25 @@ export class SessionRegistry<TContext> {
     this.#windowIdentity.set(windowId, { residentId, scopeId });
     this.#archived.delete(windowId);
     this.#active.set(windowId, window);
+    this.recordActivity(windowId);
+    for (const [listenerId, listener] of this.#windowOpenListeners) {
+      try {
+        listener({
+          residentId: window.residentId,
+          windowId: window.windowId,
+          scopeId: window.scopeId,
+          scopeGeneration: window.scopeGeneration,
+          generation: window.generation,
+        });
+      } catch (error) {
+        this.#windowOpenListenerFailures.push({
+          listenerId,
+          windowId,
+          generation,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     return { ...window };
   }
 
@@ -519,6 +554,47 @@ export class SessionRegistry<TContext> {
 
   setHead(windowId: string, headId: string | null): void {
     this.#requireLive(windowId).headId = headId;
+    this.recordActivity(windowId);
+  }
+
+  /** Host-observed activity used only to choose one responder among sibling live windows. */
+  recordActivity(windowId: string): number {
+    this.#requireLive(windowId);
+    this.#activitySeq += 1;
+    this.#activityOrdinal.set(windowId, this.#activitySeq);
+    return this.#activitySeq;
+  }
+
+  mostRecentWindow(residentId: string, scopeId: string): ActiveWindow<TContext> | undefined {
+    const candidates = this.windowsOf(residentId).filter(
+      (window) => window.scopeId === scopeId && this.#scopeMatches(window),
+    );
+    candidates.sort((left, right) => {
+      const ordinal =
+        (this.#activityOrdinal.get(right.windowId) ?? 0) -
+        (this.#activityOrdinal.get(left.windowId) ?? 0);
+      return ordinal !== 0 ? ordinal : left.windowId.localeCompare(right.windowId);
+    });
+    return candidates[0];
+  }
+
+  subscribeWindowOpened(
+    listenerId: string,
+    listener: (window: Readonly<WindowOpenedEvent>) => void,
+  ): () => void {
+    if (listenerId.length === 0 || this.#windowOpenListeners.has(listenerId)) {
+      throw new Error(`duplicate or empty window-open listener id: ${listenerId}`);
+    }
+    this.#windowOpenListeners.set(listenerId, listener);
+    return () => {
+      if (this.#windowOpenListeners.get(listenerId) === listener) {
+        this.#windowOpenListeners.delete(listenerId);
+      }
+    };
+  }
+
+  windowOpenListenerFailures(): WindowOpenListenerFailure[] {
+    return this.#windowOpenListenerFailures.map((failure) => ({ ...failure }));
   }
 
   issueDispatch(windowId: string): DispatchReceipt {
@@ -629,6 +705,7 @@ export class SessionRegistry<TContext> {
     // 先落耐久证据再改内存；追加失败时窗仍保持活态，不伪报已归档。
     this.#appendArchive(archived);
     this.#active.delete(windowId);
+    this.#activityOrdinal.delete(windowId);
     for (const [id, receipt] of this.#pendingDispatches) {
       if (receipt.windowId === windowId) this.#pendingDispatches.delete(id);
     }

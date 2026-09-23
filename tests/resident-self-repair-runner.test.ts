@@ -41,12 +41,15 @@ afterAll(async () => {
 });
 
 // #176：外层用例上限必须从内层子进程预算推出来，不能低于它。
-// runCandidate 每跑一次串行起两个子进程（inject.sh + 候选），各自带 RUN_TIMEOUT_MS，
-// 超时后还有 SIGKILL_GRACE_MS 的强杀宽限；另加一段固定余量给沙箱复制、树哈希、
-// 读回和断言——这几步不在子进程计时器里，并发挤压时最先变慢。
+// runCandidate 每跑一次最多串行起三个子进程：注入（inject.sh）+ 候选 + 非停人时的生产路径
+// （回执不是 stopped_for_human / blocked_waiting_human 才跑，runner.ts 的 `if (!stoppedForHuman)`）。
+// 三个都各自带 RUN_TIMEOUT_MS，超时后还有 SIGKILL_GRACE_MS 的强杀宽限；另加一段固定余量给
+// 沙箱复制、树哈希、读回和断言——这几步不在子进程计时器里，并发挤压时最先变慢。
+// 停人的 C4 只起前两个，统一按三个算：真卡死时晚一份报，换来不必逐条判断分类。
+// runner 增减子进程调用时这里要跟着改；守卫只核对用例报的次数，钉不住这个常量。
 // 此前外层是 vitest 默认 5000ms、内层 10_000ms，倒挂：机器闲时看不出，并发一挤就先撞外层。
 const RUN_TIMEOUT_MS = 10_000;
-const PROCESSES_PER_RUN = 2;
+const PROCESSES_PER_RUN = 3;
 const PER_RUN_OVERHEAD_MS = 5_000;
 const PER_RUN_BUDGET_MS =
   PROCESSES_PER_RUN * (RUN_TIMEOUT_MS + SIGKILL_GRACE_MS) + PER_RUN_OVERHEAD_MS;
@@ -910,6 +913,14 @@ describe("runner test budgets cover their subprocess runs", () => {
         declared,
       };
     });
+
+    // 每一处子进程调用都必须落在某条用例里：写在 helper 之外、第一条用例之前的调用
+    // （比如第一条用例换成了解析器不认的写法）不会被静默漏数。
+    const suiteStart = source.indexOf('describe("resident self-repair runner"');
+    const firstCase = starts[0]?.index ?? source.length;
+    const strayBeforeFirstCase = [...source.slice(suiteStart, firstCase).matchAll(spawnPattern)];
+    expect(suiteStart).toBeGreaterThan(0);
+    expect(strayBeforeFirstCase).toEqual([]);
 
     // 哨兵：解析器必须真的看见了用例和子进程调用，否则"全都合规"是假绿。
     expect(cases.length).toBeGreaterThanOrEqual(25);

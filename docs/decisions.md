@@ -347,6 +347,21 @@
   拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里原话「用最多的还是订阅啊！
   优先订阅！」，随后补充「apikey也不能说只做兜底…讲道理 我们本身是打算基于pi开发
   本来就支持绝大多数平台啊？只有claude 订阅要走pi claude bridge」，旦九转录。
+- 2026-09-23　**D26 主笔拍板：第一个外部信道——Telegram 先行，自家入口后做**
+  （#178 Q3）。
+  一、第一个外部信道做 Telegram 信道插件，只接 D13/D20 的 `(residentId, scopeId)`
+  绑定；Telegram 的 chat id、message id 只作外部地址，不反客为主（同 D24 第三条⑥）。
+  二、住户常驻依赖 D24 的本地参考实现；TG 插件不自带另一套常驻进程或宿主。
+  三、首个演示按 D19 群聊 v0 做：几位住户各跑一家模型、在同一个 TG 群里说话，
+  换模型后仍是同一位住户（按 D23 评测）。
+  四、自家入口（PWA、原生 app）不随本条立项，TG 跑顺后另行拍板；群里已有开发者
+  账号，届时不构成门槛。
+  代价：第一眼跟 Hermes 这类已有多信道 agent 没有区别，差异只能靠演示和长期使用
+  体现；Telegram 在部分地区要额外网络条件才能用；推送、消息格式、群权限都受
+  Telegram 平台规则约束。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793427448)；
+  拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里从「PWA 先行 / 原生 app
+  先行 / Telegram 先行」三条里亲自选定「Telegram 先行」，旦九转录。
 
 ## 规矩
 

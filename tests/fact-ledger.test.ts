@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   AckError,
-  FactLedger,
   ForeignViewportError,
   InvalidSupersedeError,
   LedgerEntryNotFoundError,
@@ -23,7 +22,8 @@ import {
   StaleViewportError,
   ViewportNotFoundError,
   WriteGateUnavailableError,
-} from "../src/store/fact-ledger.ts";
+} from "../src/store/fact-ledger-errors.ts";
+import { FactLedger } from "../src/store/fact-ledger.ts";
 
 function withTempDir(run: (dataDir: string) => void): void {
   const dataDir = mkdtempSync(join(tmpdir(), "mist-fact-ledger-"));

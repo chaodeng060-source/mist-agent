@@ -276,6 +276,7 @@
   代价：首次入住多一道住户认领的停顿，且可能停在未激活状态；三类对象分开记账，
   多两层要维护的边界。
   来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793206841)；
+  拍板人旦九（`sakisakisa-design`），咲咲 2026-09-23 在会话里授权代拍。
   #178 Elio / Helios 与墨安（dankefox）楼内收敛；对象分层参考羿与 V 的
   Zoomies / Airlock 方案（提案 authorship 归她们）。
 - 2026-09-23　**D23 主笔拍板：跨模型连续性评测——四种判词分开，不设单一判官**

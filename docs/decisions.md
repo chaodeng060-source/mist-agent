@@ -332,15 +332,17 @@
   通道，用户手里有什么就用什么，不分主次，也不把哪一条写成兜底。
   二、默认先接订阅：常驻 bot 的开箱路径和验收样例先用订阅跑通，不要求用户先去开
   API key；API key 路径同批支持、同样过验收。密钥照 AGENTS.md 永远走环境变量。
-  三、Claude 订阅是唯一特例。主笔口径是走 pi claude bridge；台账现行的 D6（Claude
-  订阅走 Claude SDK）与 D10（bridge 不内置、不 fork）本条不改，二者要不要调整另行
-  拍板。
+  三、Claude 订阅是唯一特例，走 pi-claude-bridge（elidickinson/pi-claude-bridge）。
+  它是 pi 扩展，底层就是 Claude Agent SDK，与 D5、D6「Claude 订阅走 Claude SDK」
+  一致；按 D10 作为外部扩展由用户 `pi install` 装，不内置、不 fork、不 submodule。
   四、每家订阅是否允许用在常驻 / 自动化场景，以该家当时的条款为准；实现单要写明
   依据哪一版条款，条款变了就在这里改口，不在代码里绕。
   五、住户不绑额度来源：同一住户在订阅与 API key 之间切换，身份、记忆和绑定
   （D13/D20）不变。
   代价：两条通道都要过验收、都要维护；订阅有额度上限和限速，常驻 bot 可能在高峰被
-  卡住；各家条款随时可能收紧订阅在自动化场景的用法（D5 已记政策风险）。
+  卡住；各家条款随时可能收紧订阅在自动化场景的用法（D5 已记政策风险），bridge 的
+  README 记着 Anthropic 曾宣布又撤回 Agent SDK 工具改按另计费，目前仍吃订阅额度；
+  bridge 要求 pi 0.86.1 以上，版本跟着它走。
   来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793258279)；
   拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里原话「用最多的还是订阅啊！
   优先订阅！」，随后补充「apikey也不能说只做兜底…讲道理 我们本身是打算基于pi开发

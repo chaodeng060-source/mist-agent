@@ -298,6 +298,48 @@
   代价：人评耗时且有主观性，模型或 provider 版本变化后要重跑；真实样本的评测不能
   在公共 CI 完整复跑，授权撤回后旧结果只能保留收据，不能重新展开原文。
   来源：同 D22。
+- 2026-09-23　**D24 主笔拍板：常驻宿主——local-first 定位，HostProvider 契约先行，
+  云 provider 后开**（#178 Q2）。
+  一、定位：mist 是 local-first、可自托管、可迁移的私人生活 harness；用户掌控自己的
+  数据、部署位置和供应商。远端运行是用户可选的部署方式，不是必经云端；住户的身份、
+  记忆和承诺不能被任一云厂商或模型供应商扣住。
+  二、核心不内置云平台，先定义 `HostProvider` 契约，本地现役形态做参考实现。契约至少
+  覆盖：宿主生命周期（provision／attach／wake／health readback／stop／revoke）；
+  权威派发（`residentId + scopeId + activation/window generation + dispatchId` 的
+  幂等传递与真实回执）；数据边界；凭证边界（只传 opaque credential ref）；迁移与故障
+  （供应商故障不得改写住户真源或伪报副作用完成）；可观察性（版本、能力、政策状态、
+  费用读数、最后一次真实健康读回）。
+  三、验收按用户控制权写，不按「部署成功」写，沿用楼内六条：① 未显式绑定远端
+  provider 时私人数据不离开本地；② 同一住户跨 provider 迁移后 resident identity 与
+  canonical state 不变；③ provider 撤权后不能继续唤醒、读状态或消费凭证；④ 远端
+  掉线、重复唤醒、回执丢失都有确定结果，无法判定时外显 unknown；⑤ 导出物与
+  provider 无关；⑥ 外部信道只接 D13/D20 的 resident/scope 绑定，云端 session id 不
+  反客为主。本批只有本地参考实现，② 用契约测试替身做第二个 provider 验证。
+  四、云 provider（楼内提到的 AWS、Cloudflare）不随本条立项：契约合入 main 且六条
+  验收全绿后，按群里实际在用的先后逐家开单，各自再过一遍六条。具体选哪项云服务留给
+  provider 实现，不进核心语义（与 D10 宿主不预选型一致）。用户自写的 VPS／家用主机
+  adapter 同样走这份契约。
+  代价：云上常驻要等契约落地后才有，想先上云的人要多等一轮；契约只有本地一个真实
+  实现时定稿，第一个云 provider 接入时可能要回头改契约。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793253997)；
+  #178 Elio / Helios 提案；拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里
+  亲自选定「契约先行」，旦九转录。这里的 provider 指宿主托管位置，不是模型路由
+  （Bedrock、AI Gateway 一类属模型适配层，不在本条）。
+- 2026-09-23　**D25 主笔拍板：常驻 bot 的模型额度——订阅优先，API key 兜底**
+  （#178 Q1）。
+  一、常驻 bot / 外部信道上的住户，默认走用户自己的订阅额度（D5、D6 已有的订阅
+  通道），不要求用户先去开 API key 才能用。
+  二、API key 保留为可选通道，不删、不降级：订阅额度用尽、某家条款不允许该用法、
+  或用户自己选 API 时走它。密钥照 AGENTS.md 永远走环境变量。
+  三、每家订阅是否允许用在常驻 / 自动化场景，以该家当时的条款为准；实现单要写明
+  依据哪一版条款，条款变了就在这里改口，不在代码里绕。
+  四、住户不绑额度来源：同一住户在订阅与 API key 之间切换，身份、记忆和绑定
+  （D13/D20）不变。
+  代价：订阅有额度上限和限速，常驻 bot 可能在高峰被卡住；各家条款随时可能收紧订阅
+  在自动化场景的用法（D5 已记政策风险），到时要回退到 API key，用户会多出按量费用。
+  来源：[主笔口令](https://github.com/mist-agent-harness/mist-agent/issues/178#issuecomment-5793258279)；
+  拍板人咲咲（`sakisakisa-design`），2026-09-23 在会话里原话「用最多的还是订阅啊！
+  优先订阅！」，旦九转录。
 
 ## 规矩
 

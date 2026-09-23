@@ -33,7 +33,8 @@ import { createResidentMigrationService } from "./migration/resident-store-migra
 import { BreathCommandError, parseManualBreath } from "./session/breath-trigger.ts";
 import { SessionRegistry } from "./session/session-registry.ts";
 import { type TurnEventLogger, ViewportTurnGate } from "./session/turn-gate.ts";
-import { type FactLedger, LedgerNotFoundError } from "./store/fact-ledger.ts";
+import { LedgerNotFoundError } from "./store/fact-ledger-errors.ts";
+import type { FactLedger } from "./store/fact-ledger.ts";
 import { ResidentStore } from "./store/resident-store.ts";
 
 export interface CreateDriverOptions {

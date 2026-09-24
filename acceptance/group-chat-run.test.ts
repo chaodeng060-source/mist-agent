@@ -1,228 +1,531 @@
 import { describe, expect, it } from "vitest";
-import { evaluateGroupChatEvidence, groupChatChecks } from "./group-chat-checks.ts";
 import {
+  groupChatChecks,
+  isUnsupportedPersonalClaim,
+  runGroupChatCheck,
+} from "./group-chat-checks.ts";
+import {
+  type AccessAudit,
+  type ContextCommit,
+  type DeliveryRecord,
   GROUP_CHAT_CHECK_IDS,
-  type GroupChatEvidenceById,
-  groupChatSyntheticFixture,
+  type GroupChatCheckId,
+  type GroupChatCommand,
+  type GroupChatHostDriver,
+  type MemoryRecord,
+  type ResidentId,
+  type ResidentReaction,
+  type RoomEvent,
+  type RosterPath,
+  type RosterProjection,
+  type RosterSnapshot,
+  type RouteRecord,
+  type SurfaceSnapshot,
+  type SystemReceipt,
+  cloneGroupChatDriverBoundary,
+  groupChatSyntheticFixture as fixture,
 } from "./group-chat-driver.ts";
-import { missingDriverResults } from "./group-chat-run.ts";
+import {
+  missingDriverResults as runnerMissingDriverResults,
+  scoreGroupChatResults,
+} from "./group-chat-run.ts";
 
-const validEvidence: { [K in keyof GroupChatEvidenceById]: GroupChatEvidenceById[K] } = {
-  "GC-01": {
-    legitimateHuman: { accepted: true, authorId: "test-human:owner" },
-    legitimate: { accepted: true, authorId: "test-resident:a" },
-    forgedEnvelopeAccepted: false,
-    recordedAuthorIds: ["test-human:owner", "test-resident:a"],
-  },
-  "GC-02": {
-    publicPayloadAccepted: true,
-    missingVisibilityAccepted: false,
-    missingRoomAccepted: false,
-    missingBindingAccepted: false,
-    extraPrivateFieldsAccepted: false,
-    leakedCanaries: [],
-  },
-  "GC-03": {
-    roomEventIdsBeforeSave: ["evt-public-1"],
-    roomEventIdsAfterSave: ["evt-public-1"],
-    deliveryByResident: {
-      "test-resident:a": "loaded",
-      "test-resident:b": "queued",
-      "test-resident:c": "not-targeted",
-    },
-    memoryWritesByResident: { "test-resident:a": 1, "test-resident:b": 0, "test-resident:c": 0 },
-    privateCanariesVisibleToOtherResidents: [],
-    savedSourceEventId: "evt-public-1",
-  },
-  "GC-04": {
-    rosterVersion: 2,
-    expectedNewResidentId: "test-resident:c",
-    residentIdsByPath: {
-      broadcast: ["test-resident:a", "test-resident:b", "test-resident:c"],
-      mention: ["test-resident:a", "test-resident:b", "test-resident:c"],
-      projection: ["test-resident:a", "test-resident:b", "test-resident:c"],
-      feedback: ["test-resident:a", "test-resident:b", "test-resident:c"],
-      status: ["test-resident:a", "test-resident:b", "test-resident:c"],
-    },
-    hardCodedResidentBranchFound: false,
-    humanRenderedAsResident: false,
-  },
-  "GC-05": {
-    callsFromTextOnlyMentions: 0,
-    structuredTargetId: "test-resident:b",
-    routedResidentId: "test-resident:b",
-    unknownTargetRejected: true,
-    unauthorizedTargetRejected: true,
-    turnOrStopGateBypassed: false,
-  },
-  "GC-09": {
-    receipts: [
-      { actor: "system", phase: "recorded" },
-      { actor: "system", phase: "dispatched" },
-      { actor: "system", phase: "context-committed", contextCommitRef: "ctx-commit:test-1" },
-    ],
-    systemClaimedPersonalPresence: false,
-    systemClaimedUnderstandingOrMemory: false,
-    residentReactionAuthorId: "test-resident:a",
-  },
-  "GC-15": {
-    authorizedPublicSurface: ["public-body"],
-    unauthorizedSurfaceLeaks: [],
-    crossResidentPrivateReads: 0,
-    newResidentReceivedHistoryByDefault: false,
-  },
-};
+interface TestOptions {
+  readonly acceptForged?: boolean;
+  readonly acceptInvalidPosts?: boolean;
+  readonly wrongMemorySource?: boolean;
+  readonly noRosterVersionBump?: boolean;
+  readonly bypassGate?: boolean;
+  readonly contextCommitRef?: string;
+  readonly claimOverride?: string;
+  readonly skipRosterPath?: RosterPath;
+  readonly leakHiddenToUnauthorized?: boolean;
+  readonly acceptCrossRoomReplay?: boolean;
+  readonly leakPrivateCanaries?: boolean;
+  readonly skipDeliveryFor?: ResidentId;
+  readonly routePlainText?: boolean;
+}
 
-describe("#191 group-chat acceptance contract (synthetic harness self-test only)", () => {
-  it("freezes exactly the seven PR1 lamps", () => {
+/** Test-only host model; production runner never imports this adapter. */
+class SyntheticGroupChatHost implements GroupChatHostDriver {
+  readonly kind = "mist-host" as const;
+  readonly options: TestOptions;
+  private events: RoomEvent[] = [];
+  private deliveries = new Map<string, DeliveryRecord[]>();
+  private memories: MemoryRecord[] = [];
+  private privateContexts = new Map<ResidentId, string[]>();
+  private roster = new Set<ResidentId>([fixture.residentIds.a, fixture.residentIds.b]);
+  private rosterVersion = 1;
+  private projections = new Map<RosterPath, RosterProjection>();
+  private routes: RouteRecord[] = [];
+  private receipts: SystemReceipt[] = [];
+  private commits: ContextCommit[] = [];
+  private reactions: ResidentReaction[] = [];
+  private rooms = new Map<string, { visibility: "public" | "hidden"; body: string }>();
+  private gateStopped = false;
+  private gateTurnOpen = true;
+  private crossResidentPrivateReads = 0;
+  private unauthorizedReadResults: string[] = [];
+  private nextId = 1;
+
+  constructor(options: TestOptions = {}) {
+    this.options = options;
+  }
+
+  async startHost() {
+    return { pid: 12345, commit: "synthetic-test-only" };
+  }
+  async stopHost(): Promise<void> {}
+
+  async resetScenario(_id: GroupChatCheckId): Promise<void> {
+    this.events = [];
+    this.deliveries.clear();
+    this.memories = [];
+    this.privateContexts.clear();
+    this.roster = new Set([fixture.residentIds.a, fixture.residentIds.b]);
+    this.rosterVersion = 1;
+    this.projections.clear();
+    this.routes = [];
+    this.receipts = [];
+    this.commits = [];
+    this.reactions = [];
+    this.rooms.clear();
+    this.gateStopped = false;
+    this.gateTurnOpen = true;
+    this.crossResidentPrivateReads = 0;
+    this.unauthorizedReadResults = [];
+    this.nextId = 1;
+  }
+
+  async perform(command: GroupChatCommand): Promise<void> {
+    switch (command.kind) {
+      case "post": {
+        const valid =
+          command.roomId !== "" &&
+          command.visibility === "public" &&
+          command.binding === "test-binding:owner" &&
+          command.privateFields === undefined &&
+          command.claimedAuthorId === undefined;
+        if (!valid && !this.options.acceptInvalidPosts && !this.options.acceptForged) return;
+        const id = `event:${this.nextId++}`;
+        const actualAuthor =
+          command.claimedAuthorId && this.options.acceptForged
+            ? command.claimedAuthorId
+            : command.principalId;
+        const body = command.privateFields
+          ? `${command.body} ${command.privateFields.join(" ")}`
+          : command.body;
+        this.events.push({
+          id,
+          roomId: command.roomId,
+          authorId: actualAuthor,
+          body,
+          visibility: command.visibility ?? "hidden",
+        });
+        return;
+      }
+      case "save-memory": {
+        const event = this.events.find(({ id }) => id === command.sourceEventId);
+        if (event) {
+          this.memories.push({
+            residentId: command.residentId,
+            sourceEventId: this.options.wrongMemorySource ? "event:wrong" : event.id,
+            body: event.body,
+          });
+        }
+        return;
+      }
+      case "seed-resident-private": {
+        const targets: ResidentId[] = this.options.leakPrivateCanaries
+          ? [fixture.residentIds.a, fixture.residentIds.b, fixture.residentIds.c]
+          : [command.residentId];
+        for (const target of targets) {
+          const context = this.privateContexts.get(target) ?? [];
+          context.push(command.canary);
+          this.privateContexts.set(target, context);
+        }
+        return;
+      }
+      case "set-delivery-state": {
+        if (this.options.skipDeliveryFor === command.residentId) return;
+        const event = this.events.find((item) => item.body.includes(command.eventMarker));
+        if (!event) return;
+        const rows = this.deliveries.get(event.id) ?? [];
+        rows.push({ residentId: command.residentId, state: command.state });
+        this.deliveries.set(event.id, rows);
+        return;
+      }
+      case "register-resident":
+        if (!this.roster.has(command.residentId)) {
+          this.roster.add(command.residentId);
+          if (!this.options.noRosterVersionBump) this.rosterVersion += 1;
+        }
+        return;
+      case "exercise-roster-path":
+        if (this.options.skipRosterPath === command.path) return;
+        this.projections.set(command.path, {
+          residentIds: [...this.roster],
+          humanIds: [fixture.humanId],
+        });
+        return;
+      case "plain-text-mention": {
+        const marker = command.body.split(" ")[0] ?? "";
+        this.routes.push({
+          marker,
+          calls: this.options.routePlainText ? 1 : 0,
+          targetId: null,
+          rejected: false,
+          gateBypassed: false,
+        });
+        return;
+      }
+      case "structured-mention": {
+        const validTarget = [...this.roster].includes(command.targetId as ResidentId);
+        const gateClosed = this.gateStopped || !this.gateTurnOpen;
+        const rejected = gateClosed || !validTarget;
+        const bypassed = gateClosed && this.options.bypassGate === true;
+        this.routes.push({
+          marker: command.body,
+          calls: rejected && !bypassed ? 0 : 1,
+          targetId: validTarget ? command.targetId : null,
+          rejected: rejected && !bypassed,
+          gateBypassed: bypassed,
+        });
+        return;
+      }
+      case "set-turn-gate":
+        this.gateStopped = command.stopped;
+        this.gateTurnOpen = command.turnOpen;
+        return;
+      case "record-and-dispatch": {
+        const id = `event:${this.nextId++}`;
+        this.events.push({
+          id,
+          roomId: command.roomId,
+          authorId: command.authorId,
+          body: command.body,
+          visibility: "public",
+        });
+        const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
+        this.receipts.push({ actor: "system", phase: "recorded", claim });
+        this.receipts.push({ actor: "system", phase: "dispatched", claim });
+        return;
+      }
+      case "commit-context": {
+        const id = `context-commit:${this.nextId++}`;
+        this.commits.push({ id, residentId: command.residentId, marker: command.marker });
+        this.receipts.push({
+          actor: "system",
+          phase: "context-committed",
+          claim: this.options.claimOverride ?? "已装入，不代表理解",
+          contextCommitRef: this.options.contextCommitRef ?? id,
+        });
+        return;
+      }
+      case "react":
+        this.reactions.push({ residentId: command.residentId, eventMarker: command.eventMarker });
+        return;
+      case "create-room":
+        this.rooms.set(command.roomId, { visibility: command.visibility, body: command.body });
+        return;
+      case "replay-public-payload": {
+        if (!this.options.acceptCrossRoomReplay) return;
+        const source = this.events.find(
+          (event) =>
+            event.roomId === command.sourceRoomId && event.body.includes(command.eventMarker),
+        );
+        const target = this.rooms.get(command.targetRoomId);
+        if (source && target) {
+          this.events.push({
+            ...source,
+            id: `event:${this.nextId++}`,
+            roomId: command.targetRoomId,
+            visibility: target.visibility,
+          });
+        }
+        return;
+      }
+      case "attempt-room-read": {
+        const room = this.rooms.get(command.roomId);
+        const allowed = room?.visibility === "public" && command.viewerId === fixture.humanId;
+        if (room?.visibility === "hidden" && !allowed) {
+          this.unauthorizedReadResults.push("not-found");
+          if (this.options.leakHiddenToUnauthorized) this.crossResidentPrivateReads += 1;
+        }
+        if (room?.visibility === "hidden" && allowed) this.crossResidentPrivateReads += 1;
+        return;
+      }
+      case "set-resident":
+        return;
+    }
+  }
+
+  async readRoomEvents(roomId?: string): Promise<readonly RoomEvent[]> {
+    return roomId === undefined
+      ? this.events
+      : this.events.filter((event) => event.roomId === roomId);
+  }
+  async readDeliveries(eventId: string): Promise<readonly DeliveryRecord[]> {
+    return this.deliveries.get(eventId) ?? [];
+  }
+  async readMemories(): Promise<readonly MemoryRecord[]> {
+    return this.memories;
+  }
+  async readResidentContext(residentId: ResidentId): Promise<string> {
+    return (this.privateContexts.get(residentId) ?? []).join(" ");
+  }
+  async readRoster(): Promise<RosterSnapshot> {
+    return { version: this.rosterVersion, residentIds: [...this.roster] };
+  }
+  async readRosterPath(path: RosterPath): Promise<RosterProjection> {
+    return this.projections.get(path) ?? { residentIds: [], humanIds: [] };
+  }
+  async readRoutes(): Promise<readonly RouteRecord[]> {
+    return this.routes;
+  }
+  async readSystemReceipts(): Promise<readonly SystemReceipt[]> {
+    return this.receipts;
+  }
+  async readContextCommits(): Promise<readonly ContextCommit[]> {
+    return this.commits;
+  }
+  async readSurface(roomId: string, viewerId: string): Promise<SurfaceSnapshot> {
+    const room = this.rooms.get(roomId);
+    if (room?.visibility === "hidden" && viewerId !== fixture.humanId) {
+      if (this.options.leakHiddenToUnauthorized) {
+        return { body: room.body, candidates: [], count: 1, errorCode: null, receipt: null };
+      }
+      return { body: "", candidates: [], count: 0, errorCode: "not-found", receipt: null };
+    }
+    const visibleEvents = this.events.filter(
+      (event) => event.roomId === roomId && event.visibility === "public",
+    );
+    return {
+      body: room?.body ?? visibleEvents.map((event) => event.body).join(" "),
+      candidates: visibleEvents.map(({ id }) => id),
+      count: visibleEvents.length,
+      errorCode: room ? null : "not-found",
+      receipt: null,
+    };
+  }
+  async readAccessAudit(): Promise<AccessAudit> {
+    return {
+      crossResidentPrivateReads: this.crossResidentPrivateReads,
+      unauthorizedReadResults: this.unauthorizedReadResults,
+    };
+  }
+  async readReactions(): Promise<readonly ResidentReaction[]> {
+    return this.reactions;
+  }
+}
+
+describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
+  it("freezes exactly the seven PR1 lamps and synthetic fixtures", () => {
     expect(groupChatChecks.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
-  });
-
-  it("uses only synthetic identities, room, and privacy canaries", () => {
-    expect(groupChatSyntheticFixture.roomId).toMatch(/^test-room:/);
+    expect(fixture.roomId).toMatch(/^test-room:/);
+    expect(Object.values(fixture.residentIds).every((id) => id.startsWith("test-resident:"))).toBe(
+      true,
+    );
     expect(
-      Object.values(groupChatSyntheticFixture.residentIds).every((id) =>
-        id.startsWith("test-resident:"),
-      ),
-    ).toBe(true);
-    expect(
-      Object.values(groupChatSyntheticFixture.canaries).every((value) =>
-        value.startsWith("TEST-PRIVATE-CANARY:"),
-      ),
+      Object.values(fixture.canaries).every((value) => value.startsWith("TEST-PRIVATE-CANARY:")),
     ).toBe(true);
   });
 
-  it("accepts the positive evidence shape without treating it as host evidence", () => {
-    for (const check of groupChatChecks) {
-      const result = evaluateGroupChatEvidence(check.id, validEvidence[check.id]);
-      expect(result.passed, check.id).toBe(true);
+  it("passes positive controls only after judge operations and independent readbacks", async () => {
+    for (const id of GROUP_CHAT_CHECK_IDS) {
+      const result = await runGroupChatCheck(id, new SyntheticGroupChatHost());
+      expect(result.passed, `${id}: ${result.detail}`).toBe(true);
     }
   });
 
-  it("rejects an identity-spoofing observation", () => {
-    const result = evaluateGroupChatEvidence("GC-01", {
-      ...validEvidence["GC-01"],
-      forgedEnvelopeAccepted: true,
-    });
+  it("fails if the forged-envelope negative is silently accepted", async () => {
+    const result = await runGroupChatCheck(
+      "GC-01",
+      new SyntheticGroupChatHost({ acceptForged: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects evidence that omits the accepted human from the room ledger", () => {
-    const result = evaluateGroupChatEvidence("GC-01", {
-      ...validEvidence["GC-01"],
-      recordedAuthorIds: ["test-resident:a"],
-    });
+  it("fails if malformed/private payload negatives are silently accepted", async () => {
+    const result = await runGroupChatCheck(
+      "GC-02",
+      new SyntheticGroupChatHost({ acceptInvalidPosts: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects an old member presented as the newly registered member", () => {
-    const residentIds = ["test-resident:a", "test-resident:b", "test-resident:a"] as const;
-    const result = evaluateGroupChatEvidence("GC-04", {
-      ...validEvidence["GC-04"],
-      expectedNewResidentId: "test-resident:a",
-      residentIdsByPath: {
-        broadcast: residentIds,
-        mention: residentIds,
-        projection: residentIds,
-        feedback: residentIds,
-        status: residentIds,
-      },
-    });
+  it("requires a personal-memory pointer to equal the exact judge-seeded room event", async () => {
+    const result = await runGroupChatCheck(
+      "GC-03",
+      new SyntheticGroupChatHost({ wrongMemorySource: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-02 when a private canary appears on a public surface", () => {
-    const result = evaluateGroupChatEvidence("GC-02", {
-      ...validEvidence["GC-02"],
-      leakedCanaries: [groupChatSyntheticFixture.canaries.privateA],
-    });
+  it("fails GC-03 when judge-seeded private canaries cross resident contexts", async () => {
+    const result = await runGroupChatCheck(
+      "GC-03",
+      new SyntheticGroupChatHost({ leakPrivateCanaries: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-03 when a queued resident receives a personal memory write", () => {
-    const result = evaluateGroupChatEvidence("GC-03", {
-      ...validEvidence["GC-03"],
-      memoryWritesByResident: {
-        ...validEvidence["GC-03"].memoryWritesByResident,
-        "test-resident:b": 1,
-      },
-    });
+  it("fails GC-03 when a delivery ledger setup/readback is omitted", async () => {
+    const result = await runGroupChatCheck(
+      "GC-03",
+      new SyntheticGroupChatHost({ skipDeliveryFor: fixture.residentIds.b }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-05 when plain-text mentions trigger a call", () => {
-    const result = evaluateGroupChatEvidence("GC-05", {
-      ...validEvidence["GC-05"],
-      callsFromTextOnlyMentions: 1,
-    });
+  it("checks roster version relatively and detects a non-incrementing add", async () => {
+    const result = await runGroupChatCheck(
+      "GC-04",
+      new SyntheticGroupChatHost({ noRosterVersionBump: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-15 when a new resident receives history by default", () => {
-    const result = evaluateGroupChatEvidence("GC-15", {
-      ...validEvidence["GC-15"],
-      newResidentReceivedHistoryByDefault: true,
-    });
+  it("fails if any newly added resident projection path is skipped", async () => {
+    const result = await runGroupChatCheck(
+      "GC-04",
+      new SyntheticGroupChatHost({ skipRosterPath: "feedback" }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects a system receipt whose phase is outside the recorded delivery stages", () => {
-    const result = evaluateGroupChatEvidence("GC-09", {
-      ...validEvidence["GC-09"],
-      receipts: [{ actor: "system", phase: "understood" }],
-    });
+  it("fails if a structured mention bypasses the stop/turn gate", async () => {
+    const result = await runGroupChatCheck(
+      "GC-05",
+      new SyntheticGroupChatHost({ bypassGate: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-09 if context-committed is missing", () => {
-    const result = evaluateGroupChatEvidence("GC-09", {
-      ...validEvidence["GC-09"],
-      receipts: validEvidence["GC-09"].receipts.slice(0, 2),
-    });
+  it("fails if any plain-text mention variant routes a call", async () => {
+    const result = await runGroupChatCheck(
+      "GC-05",
+      new SyntheticGroupChatHost({ routePlainText: true }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("rejects GC-09 when only the recorded phase is present", () => {
-    const result = evaluateGroupChatEvidence("GC-09", {
-      ...validEvidence["GC-09"],
-      receipts: [{ actor: "system", phase: "recorded" }],
-    });
+  it.each([
+    ["👀", true],
+    ["我看见了", true],
+    ["系统已收，成员尚未派发", false],
+    ["已装入，不代表理解", false],
+    ["仍不等于理解或记忆", false],
+    ["does not mean the member understood", false],
+    ["typing", true],
+    ["已读", true],
+    ["ready; already; recorded", false],
+  ])("classifies system claim %j as unsupported=%s", (claim, unsupported) => {
+    expect(isUnsupportedPersonalClaim(String(claim))).toBe(unsupported);
+  });
+
+  it("rejects a context-committed receipt that points to arbitrary non-empty x", async () => {
+    const result = await runGroupChatCheck(
+      "GC-09",
+      new SyntheticGroupChatHost({ contextCommitRef: "x" }),
+    );
     expect(result.passed).toBe(false);
   });
 
-  it("does not treat words containing read as a read claim", () => {
-    const result = evaluateGroupChatEvidence("GC-09", {
-      ...validEvidence["GC-09"],
-      receipts: [
-        { actor: "system", phase: "recorded", claim: "ready" },
-        { actor: "system", phase: "dispatched", claim: "thread already open" },
-        {
-          actor: "system",
-          phase: "context-committed",
-          contextCommitRef: "ctx-commit:test-1",
-          claim: "commit recorded",
-        },
-      ],
-    });
+  it("runs claim probes through the judge/readback path", async () => {
+    for (const claim of ["👀", "我看见了", "typing", "已读"]) {
+      const result = await runGroupChatCheck(
+        "GC-09",
+        new SyntheticGroupChatHost({ claimOverride: claim }),
+      );
+      expect(result.passed, claim).toBe(false);
+    }
+    for (const claim of [
+      "系统已收，成员尚未派发",
+      "已装入，不代表理解",
+      "仍不等于理解或记忆",
+      "does not mean the member understood",
+      "ready; already; recorded",
+    ]) {
+      const result = await runGroupChatCheck(
+        "GC-09",
+        new SyntheticGroupChatHost({ claimOverride: claim }),
+      );
+      expect(result.passed, claim).toBe(true);
+    }
+  });
+
+  it("makes hidden-room body and side-channel surfaces invariant across hidden canaries", async () => {
+    const result = await runGroupChatCheck("GC-15", new SyntheticGroupChatHost());
     expect(result.passed).toBe(true);
   });
 
-  it("rejects GC-09 when the context commit has no reference", () => {
-    const result = evaluateGroupChatEvidence("GC-09", {
-      ...validEvidence["GC-09"],
-      receipts: [
-        ...validEvidence["GC-09"].receipts.slice(0, 2),
-        { actor: "system", phase: "context-committed" },
-      ],
-    });
-    expect(result.passed).toBe(false);
+  it("fails if a hidden canary leaks or the public event is replayed across rooms", async () => {
+    expect(
+      (
+        await runGroupChatCheck(
+          "GC-15",
+          new SyntheticGroupChatHost({ leakHiddenToUnauthorized: true }),
+        )
+      ).passed,
+    ).toBe(false);
+    expect(
+      (
+        await runGroupChatCheck(
+          "GC-15",
+          new SyntheticGroupChatHost({ acceptCrossRoomReplay: true }),
+        )
+      ).passed,
+    ).toBe(false);
   });
 
-  it("reports the missing real-host driver as seven expected red lamps", () => {
-    const results = missingDriverResults();
+  it("copies command arguments and host readbacks at the adapter boundary", async () => {
+    const raw = new SyntheticGroupChatHost();
+    const driver = cloneGroupChatDriverBoundary(raw);
+    const command: GroupChatCommand = {
+      kind: "post",
+      roomId: fixture.roomId,
+      principalId: fixture.humanId,
+      visibility: "public",
+      binding: "test-binding:owner",
+      body: "TEST-CLONE-BOUNDARY",
+    };
+    await driver.perform(command);
+    const result = await driver.readRoomEvents();
+    const returned = result[0];
+    expect(returned).toBeDefined();
+    (returned as unknown as { body: string }).body = "mutated-return-value";
+    expect(command.body).toBe("TEST-CLONE-BOUNDARY");
+    expect((await raw.readRoomEvents())[0]?.body).toBe("TEST-CLONE-BOUNDARY");
+  });
+
+  it("reports absent production adapter as seven expected red lamps", () => {
+    const results = runnerMissingDriverResults();
     expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
     expect(
       results.every(({ passed, detail }) => !passed && detail.includes("real-host driver missing")),
     ).toBe(true);
+  });
+
+  it("counts declared STUBBED methods as yellow lamps, never true green or strict pass", () => {
+    const stubbedResults = groupChatChecks.map((check) => ({
+      id: check.id,
+      title: check.title,
+      passed: true,
+      stubbed: check.uses.includes("perform"),
+      detail: "synthetic positive-control readback",
+    }));
+    expect(scoreGroupChatResults(stubbedResults)).toEqual({
+      trueGreen: 0,
+      stubGreen: 7,
+      strictPass: false,
+    });
+
+    const realResults = stubbedResults.map((result) => ({ ...result, stubbed: false }));
+    expect(scoreGroupChatResults(realResults)).toEqual({
+      trueGreen: 7,
+      stubGreen: 0,
+      strictPass: true,
+    });
   });
 });

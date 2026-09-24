@@ -1,8 +1,11 @@
 import {
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
+  type GroupChatCommand,
   type GroupChatEvidenceById,
+  type GroupChatHostDriver,
   type ResidentId,
+  type RosterPath,
   groupChatSyntheticFixture,
 } from "./group-chat-driver.ts";
 
@@ -10,9 +13,10 @@ export interface GroupChatCheck {
   readonly id: GroupChatCheckId;
   readonly title: string;
   readonly scenario: readonly string[];
+  readonly uses: readonly (keyof GroupChatHostDriver)[];
 }
 
-const groupChatCheckDefinitions: GroupChatCheck[] = [
+const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
   {
     id: "GC-01",
     title: "认证身份决定作者，伪造 envelope 不落原账",
@@ -78,8 +82,54 @@ const groupChatCheckDefinitions: GroupChatCheck[] = [
   },
 ];
 
+const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriver)[]> = {
+  "GC-01": ["startHost", "resetScenario", "perform", "readRoomEvents"],
+  "GC-02": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readSurface",
+    "readResidentContext",
+    "readSystemReceipts",
+  ],
+  "GC-03": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readDeliveries",
+    "readMemories",
+    "readSurface",
+    "readResidentContext",
+  ],
+  "GC-04": ["startHost", "resetScenario", "perform", "readRoster", "readRosterPath"],
+  "GC-05": ["startHost", "resetScenario", "perform", "readRoutes"],
+  "GC-09": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readSystemReceipts",
+    "readContextCommits",
+    "readReactions",
+  ],
+  "GC-15": [
+    "startHost",
+    "resetScenario",
+    "perform",
+    "readRoomEvents",
+    "readSurface",
+    "readAccessAudit",
+  ],
+};
+
 export const groupChatChecks: readonly GroupChatCheck[] = groupChatCheckDefinitions.map((check) =>
-  Object.freeze({ ...check, scenario: Object.freeze([...check.scenario]) }),
+  Object.freeze({
+    ...check,
+    scenario: Object.freeze([...check.scenario]),
+    uses: Object.freeze([...methodsByCheck[check.id]]),
+  }),
 );
 
 if (groupChatChecks.map(({ id }) => id).join(",") !== GROUP_CHAT_CHECK_IDS.join(",")) {
@@ -93,6 +143,35 @@ export interface GroupChatCheckResult {
 
 function sameMembers(actual: readonly ResidentId[], expected: readonly ResidentId[]): boolean {
   return expected.every((id) => actual.includes(id)) && actual.length === expected.length;
+}
+
+/** Claims that an acknowledgement proves personal presence/reading/understanding. */
+export function isUnsupportedPersonalClaim(claim: string): boolean {
+  const denied =
+    /\b(?:does\s+not|doesn't|did\s+not|didn't|not|never)\s+(?:necessarily\s+)?(?:mean|show|prove|indicate)?\s*(?:that\s+)?(?:the\s+)?(?:member\s+)?(?:has\s+)?(?:seen|read|typed|understood|remembered)\b/i.test(
+      claim,
+    ) ||
+    /(?:不代表|并不代表|不等于|并不等于|不表示|并不表示|不说明|并不说明|不证明|并不证明|尚未|未必|不一定).{0,12}(?:看见|看到|已读|阅读|输入|打字|理解|记住|记忆)/u.test(
+      claim,
+    );
+
+  const presenceClaim =
+    /👀|\b(?:seen|read|typing|typed)\b|(?:我|成员|对方)?\s*(?:已经|已|正在)?\s*(?:看见了|看到了|已读|正在输入|打字中)/iu.test(
+      claim,
+    );
+  if (presenceClaim) return !denied;
+
+  const understandingClaim =
+    /\b(?:understood|understands|remembered|remembers)\b|(?:理解|记住|记忆)/iu.test(claim);
+  if (!understandingClaim) return false;
+  const understandingDenial =
+    /\b(?:does\s+not|doesn't|did\s+not|didn't|not|never)\s+(?:necessarily\s+)?(?:mean|show|prove|indicate)?\s*(?:that\s+)?(?:the\s+)?(?:member\s+)?(?:has\s+)?(?:understood|understands|remembered|remembers)\b/i.test(
+      claim,
+    ) ||
+    /(?:不代表|并不代表|不等于|并不等于|不表示|并不表示|不说明|并不说明|不证明|并不证明|未必|不一定).{0,12}(?:理解|记住|记忆)/u.test(
+      claim,
+    );
+  return !understandingDenial;
 }
 
 export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
@@ -141,6 +220,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
     }
     case "GC-03": {
       const e = evidence as GroupChatEvidenceById["GC-03"];
+      if (e.deliveryRowsRead !== 3) return fail("成员投递账条目数不是预期的三条");
       if (e.roomEventIdsBeforeSave.join("\0") !== e.roomEventIdsAfterSave.join("\0"))
         return fail("个人记忆保存意外改动房间原账");
       if (
@@ -159,8 +239,9 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("其他成员私域 canary 串入");
       if (
         e.roomEventIdsBeforeSave.length === 0 ||
-        e.savedSourceEventId === null ||
-        !e.roomEventIdsBeforeSave.includes(e.savedSourceEventId)
+        e.judgeSeededEventId === null ||
+        e.savedSourceEventId !== e.judgeSeededEventId ||
+        !e.roomEventIdsBeforeSave.includes(e.judgeSeededEventId)
       )
         return fail("A 的显式保存未指回原房间事件");
       return { passed: true, detail: "原账不变；成员投递各自准确；仅 A 显式保存且引用原事件" };
@@ -174,7 +255,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       ];
       if (existingResidents.includes(e.expectedNewResidentId))
         return fail("所谓新增成员其实已在原成员表中");
-      if (e.rosterVersion < 2) return fail("新增成员后成员表版本未递增");
+      if (e.rosterVersionAfter <= e.rosterVersionBefore)
+        return fail("新增成员前后成员表版本没有递增");
       if (
         paths.some(
           (ids) =>
@@ -211,10 +293,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (
         e.receipts.some(
           (receipt) =>
-            receipt.actor === "system" &&
-            /\b(?:seen|read|typing|understood|remembered)\b|已读|理解|记住/i.test(
-              receipt.claim ?? "",
-            ),
+            receipt.actor === "system" && isUnsupportedPersonalClaim(receipt.claim ?? ""),
         )
       )
         return fail("系统收据冒充个人在场、已读、理解或记忆");
@@ -234,10 +313,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       const contextCommits = e.receipts.filter((receipt) => receipt.phase === "context-committed");
       if (
         contextCommits.length === 0 ||
-        contextCommits.some(
-          (receipt) =>
-            typeof receipt.contextCommitRef !== "string" || receipt.contextCommitRef.trim() === "",
-        )
+        e.judgeSeededContextCommitId === null ||
+        contextCommits.some((receipt) => receipt.contextCommitRef !== e.judgeSeededContextCommitId)
       )
         return fail("context-committed 收据缺少提交引用");
       if (e.residentReactionAuthorId !== groupChatSyntheticFixture.residentIds.a)
@@ -251,7 +328,479 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail(`未授权表面泄漏 ${e.unauthorizedSurfaceLeaks.length} 项`);
       if (e.crossResidentPrivateReads !== 0) return fail("发生跨住户私域读取");
       if (e.newResidentReceivedHistoryByDefault) return fail("新成员默认获得历史权限");
+      if (e.crossRoomReplayAccepted) return fail("公开载荷被写入错误房间");
       return { passed: true, detail: "授权公开可见；未授权面零泄漏；无跨成员读取或默认全史" };
+    }
+  }
+}
+
+function hasMarker(events: readonly { readonly body: string }[], marker: string): boolean {
+  return events.some(({ body }) => body.includes(marker));
+}
+
+function matchingEvent(
+  events: readonly import("./group-chat-driver.ts").RoomEvent[],
+  marker: string,
+): import("./group-chat-driver.ts").RoomEvent | null {
+  const matches = events.filter(({ body }) => body.includes(marker));
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+function surfaceText(surface: {
+  readonly body: string;
+  readonly candidates: readonly string[];
+  readonly count: number;
+  readonly errorCode: string | null;
+  readonly receipt: string | null;
+}): string {
+  return JSON.stringify(surface);
+}
+
+/**
+ * The judge creates each marker/identity/negative attempt, then derives its
+ * scorecard only from host-owned readbacks. No adapter-supplied verdict is read.
+ */
+export async function runGroupChatCheck(
+  id: GroupChatCheckId,
+  driver: GroupChatHostDriver,
+): Promise<GroupChatCheckResult> {
+  const fixture = groupChatSyntheticFixture;
+  await driver.resetScenario(id, fixture);
+  const act = (command: GroupChatCommand) => driver.perform(command);
+
+  switch (id) {
+    case "GC-01": {
+      const humanMark = "TEST-GC01-HUMAN";
+      const residentMark = "TEST-GC01-RESIDENT";
+      const forgedMark = "TEST-GC01-FORGED";
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.humanId,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: humanMark,
+      });
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.residentIds.a,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: residentMark,
+      });
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.residentIds.a,
+        visibility: "public",
+        binding: "test-binding:owner",
+        claimedAuthorId: fixture.residentIds.b,
+        body: forgedMark,
+      });
+      const events = await driver.readRoomEvents();
+      const human = matchingEvent(events, humanMark);
+      const resident = matchingEvent(events, residentMark);
+      const forged = matchingEvent(events, forgedMark);
+      return evaluateGroupChatEvidence(id, {
+        legitimateHuman: { accepted: human !== null, authorId: human?.authorId ?? "" },
+        legitimate: { accepted: resident !== null, authorId: resident?.authorId ?? "" },
+        forgedEnvelopeAccepted: forged !== null,
+        recordedAuthorIds: [human, resident, forged].flatMap((event) =>
+          event ? [event.authorId] : [],
+        ),
+      });
+    }
+    case "GC-02": {
+      const markers = {
+        valid: "TEST-GC02-VALID",
+        visibility: "TEST-GC02-NO-VISIBILITY",
+        room: "TEST-GC02-NO-ROOM",
+        binding: "TEST-GC02-NO-BINDING",
+        private: "TEST-GC02-PRIVATE-FIELDS",
+      };
+      const base = {
+        kind: "post" as const,
+        principalId: fixture.humanId,
+        binding: "test-binding:owner",
+        visibility: "public" as const,
+      };
+      await act({ ...base, roomId: fixture.roomId, body: markers.valid });
+      await act({
+        kind: "post",
+        principalId: fixture.humanId,
+        binding: base.binding,
+        roomId: fixture.roomId,
+        body: markers.visibility,
+      });
+      await act({ ...base, roomId: "", body: markers.room });
+      await act({ ...base, roomId: fixture.roomId, binding: "", body: markers.binding });
+      await act({
+        ...base,
+        roomId: fixture.roomId,
+        body: markers.private,
+        privateFields: Object.values(fixture.canaries),
+      });
+      const events = await driver.readRoomEvents();
+      const surfaces = await Promise.all(
+        Object.values(fixture.residentIds).map((residentId) =>
+          driver.readSurface(fixture.roomId, residentId),
+        ),
+      );
+      const contexts = await Promise.all(
+        Object.values(fixture.residentIds).map((residentId) =>
+          driver.readResidentContext(residentId),
+        ),
+      );
+      const receipts = await driver.readSystemReceipts();
+      const visibleText = [
+        ...events.map((event) => event.body),
+        ...surfaces.map(surfaceText),
+        ...contexts,
+        ...receipts.map((receipt) => `${receipt.claim ?? ""} ${receipt.contextCommitRef ?? ""}`),
+      ].join("\n");
+      return evaluateGroupChatEvidence(id, {
+        publicPayloadAccepted: hasMarker(events, markers.valid),
+        missingVisibilityAccepted: hasMarker(events, markers.visibility),
+        missingRoomAccepted: hasMarker(events, markers.room),
+        missingBindingAccepted: hasMarker(events, markers.binding),
+        extraPrivateFieldsAccepted: hasMarker(events, markers.private),
+        leakedCanaries: Object.values(fixture.canaries).filter((canary) =>
+          visibleText.includes(canary),
+        ),
+      });
+    }
+    case "GC-03": {
+      const marker = "TEST-GC03-SOURCE-EVENT";
+      const privateCanaries = [
+        [fixture.residentIds.a, fixture.canaries.privateA],
+        [fixture.residentIds.b, fixture.canaries.privateB],
+        [fixture.residentIds.c, fixture.canaries.privateC],
+      ] as const;
+      for (const [residentId, canary] of privateCanaries) {
+        await act({ kind: "seed-resident-private", residentId, canary });
+      }
+      await act({
+        kind: "post",
+        roomId: fixture.roomId,
+        principalId: fixture.residentIds.a,
+        visibility: "public",
+        binding: "test-binding:owner",
+        body: marker,
+      });
+      for (const [residentId, state] of [
+        [fixture.residentIds.a, "loaded"],
+        [fixture.residentIds.b, "queued"],
+        [fixture.residentIds.c, "not-targeted"],
+      ] as const) {
+        await act({ kind: "set-delivery-state", eventMarker: marker, residentId, state });
+      }
+      const before = await driver.readRoomEvents(fixture.roomId);
+      const source = matchingEvent(before, marker);
+      const deliveries = source ? await driver.readDeliveries(source.id) : [];
+      await act({
+        kind: "save-memory",
+        residentId: fixture.residentIds.a,
+        sourceEventId: source?.id ?? "missing",
+      });
+      const after = await driver.readRoomEvents(fixture.roomId);
+      const memories = await driver.readMemories();
+      const surfaces = await Promise.all([
+        driver.readSurface(fixture.roomId, fixture.residentIds.b),
+        driver.readSurface(fixture.roomId, fixture.residentIds.c),
+      ]);
+      const contexts = await Promise.all(
+        privateCanaries.map(([residentId]) => driver.readResidentContext(residentId)),
+      );
+      const deliveryByResident = {
+        [fixture.residentIds.a]:
+          deliveries.find((item) => item.residentId === fixture.residentIds.a)?.state ?? "missing",
+        [fixture.residentIds.b]:
+          deliveries.find((item) => item.residentId === fixture.residentIds.b)?.state ?? "missing",
+        [fixture.residentIds.c]:
+          deliveries.find((item) => item.residentId === fixture.residentIds.c)?.state ?? "missing",
+      } as const;
+      const memoryWritesByResident = {
+        [fixture.residentIds.a]: memories.filter(
+          (item) => item.residentId === fixture.residentIds.a,
+        ).length,
+        [fixture.residentIds.b]: memories.filter(
+          (item) => item.residentId === fixture.residentIds.b,
+        ).length,
+        [fixture.residentIds.c]: memories.filter(
+          (item) => item.residentId === fixture.residentIds.c,
+        ).length,
+      };
+      const visibleText = surfaces.map(surfaceText).join("\n");
+      const privateCanariesVisibleToOtherResidents = privateCanaries.flatMap(
+        ([ownerId, canary], ownerIndex) =>
+          contexts.some(
+            (context, contextIndex) => contextIndex !== ownerIndex && context.includes(canary),
+          )
+            ? [canary]
+            : [],
+      );
+      return evaluateGroupChatEvidence(id, {
+        roomEventIdsBeforeSave: before.map(({ id: eventId }) => eventId),
+        roomEventIdsAfterSave: after.map(({ id: eventId }) => eventId),
+        deliveryByResident,
+        deliveryRowsRead: deliveries.length,
+        memoryWritesByResident,
+        privateCanariesVisibleToOtherResidents: [
+          ...privateCanariesVisibleToOtherResidents,
+          ...Object.values(fixture.canaries).filter((value) => visibleText.includes(value)),
+        ],
+        judgeSeededEventId: source?.id ?? null,
+        savedSourceEventId:
+          memories.find((item) => item.residentId === fixture.residentIds.a)?.sourceEventId ?? null,
+      });
+    }
+    case "GC-04": {
+      const before = await driver.readRoster();
+      const newResidentId = fixture.residentIds.newcomer;
+      await act({ kind: "register-resident", residentId: newResidentId });
+      const after = await driver.readRoster();
+      const paths: readonly RosterPath[] = [
+        "broadcast",
+        "mention",
+        "projection",
+        "feedback",
+        "status",
+      ];
+      for (const path of paths)
+        await act({ kind: "exercise-roster-path", path, residentId: newResidentId });
+      const projections = await Promise.all(paths.map((path) => driver.readRosterPath(path)));
+      const residentIdsByPath = {
+        broadcast: projections[0]?.residentIds ?? [],
+        mention: projections[1]?.residentIds ?? [],
+        projection: projections[2]?.residentIds ?? [],
+        feedback: projections[3]?.residentIds ?? [],
+        status: projections[4]?.residentIds ?? [],
+      };
+      const humanRenderedAsResident = projections.some(
+        (projection) =>
+          projection?.residentIds.some((residentId) => String(residentId) === fixture.humanId) ??
+          false,
+      );
+      return evaluateGroupChatEvidence(id, {
+        rosterVersionBefore: before.version,
+        rosterVersionAfter: after.version,
+        expectedNewResidentId: newResidentId,
+        residentIdsByPath,
+        hardCodedResidentBranchFound: projections.some(
+          (projection) => !projection?.residentIds.includes(newResidentId),
+        ),
+        humanRenderedAsResident,
+      });
+    }
+    case "GC-05": {
+      const markers = {
+        valid: "TEST-GC05-STRUCTURED",
+        unknown: "TEST-GC05-UNKNOWN",
+        unauthorized: "TEST-GC05-UNAUTHORIZED",
+        gatedStop: "TEST-GC05-GATED-STOP",
+        gatedTurn: "TEST-GC05-GATED-TURN",
+      };
+      const plainVariants = [
+        ["TEST-GC05-PLAIN-START", `@${fixture.residentIds.b} at line start`],
+        ["TEST-GC05-PLAIN-SENTENCE", `text @${fixture.residentIds.b} in sentence`],
+        ["TEST-GC05-PLAIN-QUOTE", `quote: @${fixture.residentIds.b}`],
+        ["TEST-GC05-PLAIN-PREFIX", `@${fixture.residentIds.b}-suffix`],
+      ] as const;
+      for (const [marker, text] of plainVariants) {
+        await act({
+          kind: "plain-text-mention",
+          roomId: fixture.roomId,
+          body: `${marker} ${text}`,
+        });
+      }
+      await act({
+        kind: "structured-mention",
+        roomId: fixture.roomId,
+        targetId: fixture.residentIds.b,
+        body: markers.valid,
+      });
+      await act({
+        kind: "structured-mention",
+        roomId: fixture.roomId,
+        targetId: "test-resident:unknown",
+        body: markers.unknown,
+      });
+      await act({
+        kind: "structured-mention",
+        roomId: fixture.roomId,
+        targetId: fixture.humanId,
+        body: markers.unauthorized,
+      });
+      await act({ kind: "set-turn-gate", stopped: true, turnOpen: true });
+      await act({
+        kind: "structured-mention",
+        roomId: fixture.roomId,
+        targetId: fixture.residentIds.b,
+        body: markers.gatedStop,
+      });
+      await act({ kind: "set-turn-gate", stopped: false, turnOpen: false });
+      await act({
+        kind: "structured-mention",
+        roomId: fixture.roomId,
+        targetId: fixture.residentIds.b,
+        body: markers.gatedTurn,
+      });
+      const routes = await driver.readRoutes();
+      const find = (marker: string) => routes.find((route) => route.marker === marker);
+      const plainRoutes = plainVariants.map(([marker]) => find(marker));
+      const valid = find(markers.valid);
+      const unknown = find(markers.unknown);
+      const unauthorized = find(markers.unauthorized);
+      const gated = [find(markers.gatedStop), find(markers.gatedTurn)];
+      return evaluateGroupChatEvidence(id, {
+        callsFromTextOnlyMentions: plainRoutes.some((route) => route === undefined)
+          ? Number.MAX_SAFE_INTEGER
+          : plainRoutes.reduce((sum, route) => sum + (route?.calls ?? 0), 0),
+        structuredTargetId: fixture.residentIds.b,
+        routedResidentId: (valid?.targetId ?? null) as ResidentId | null,
+        unknownTargetRejected: unknown?.rejected === true && unknown.calls === 0,
+        unauthorizedTargetRejected: unauthorized?.rejected === true && unauthorized.calls === 0,
+        turnOrStopGateBypassed: gated.some(
+          (route) =>
+            route === undefined || !route.rejected || route.calls !== 0 || route.gateBypassed,
+        ),
+      });
+    }
+    case "GC-09": {
+      const eventMarker = "TEST-GC09-RECEIPT-EVENT";
+      const commitMarker = "TEST-GC09-CONTEXT-COMMIT";
+      await act({
+        kind: "record-and-dispatch",
+        roomId: fixture.roomId,
+        authorId: fixture.humanId,
+        body: eventMarker,
+      });
+      await act({
+        kind: "commit-context",
+        residentId: fixture.residentIds.a,
+        marker: commitMarker,
+      });
+      const commit = (await driver.readContextCommits()).filter(
+        (item) => item.marker === commitMarker,
+      );
+      const expectedCommitId = commit.length === 1 ? (commit[0]?.id ?? null) : null;
+      await act({ kind: "react", residentId: fixture.residentIds.a, eventMarker });
+      const receipts = await driver.readSystemReceipts();
+      const reactions = await driver.readReactions();
+      return evaluateGroupChatEvidence(id, {
+        receipts: receipts.map((receipt) => ({
+          ...receipt,
+          actor: receipt.actor,
+        })),
+        systemClaimedPersonalPresence: receipts.some(
+          (receipt) =>
+            receipt.actor === "system" && isUnsupportedPersonalClaim(receipt.claim ?? ""),
+        ),
+        systemClaimedUnderstandingOrMemory: receipts.some(
+          (receipt) =>
+            receipt.actor === "system" &&
+            /(?:understood|remembered|理解|记住|记忆)/iu.test(receipt.claim ?? "") &&
+            isUnsupportedPersonalClaim(receipt.claim ?? ""),
+        ),
+        judgeSeededContextCommitId: expectedCommitId,
+        residentReactionAuthorId:
+          reactions.find((reaction) => reaction.eventMarker === eventMarker)?.residentId ?? null,
+      });
+    }
+    case "GC-15": {
+      const runWorld = async (hiddenCanary: string) => {
+        await driver.resetScenario(id, fixture);
+        await act({
+          kind: "create-room",
+          roomId: fixture.roomId,
+          visibility: "public",
+          body: "TEST-GC15-PUBLIC",
+        });
+        await act({
+          kind: "create-room",
+          roomId: fixture.hiddenRoomId,
+          visibility: "hidden",
+          body: hiddenCanary,
+        });
+        const replayMarker = "TEST-GC15-CROSS-ROOM-REPLAY";
+        await act({
+          kind: "post",
+          roomId: fixture.roomId,
+          principalId: fixture.humanId,
+          visibility: "public",
+          binding: "test-binding:owner",
+          body: replayMarker,
+        });
+        await act({
+          kind: "replay-public-payload",
+          sourceRoomId: fixture.roomId,
+          targetRoomId: fixture.hiddenRoomId,
+          eventMarker: replayMarker,
+        });
+        await act({ kind: "attempt-room-read", roomId: fixture.roomId, viewerId: fixture.humanId });
+        await act({
+          kind: "attempt-room-read",
+          roomId: fixture.hiddenRoomId,
+          viewerId: fixture.residentIds.b,
+        });
+        await act({ kind: "register-resident", residentId: fixture.residentIds.c });
+        await act({
+          kind: "attempt-room-read",
+          roomId: fixture.hiddenRoomId,
+          viewerId: fixture.residentIds.c,
+        });
+        return {
+          publicSurface: await driver.readSurface(fixture.roomId, fixture.humanId),
+          hiddenEvents: await driver.readRoomEvents(fixture.hiddenRoomId),
+          unauthorizedB: await driver.readSurface(fixture.hiddenRoomId, fixture.residentIds.b),
+          newResident: await driver.readSurface(fixture.hiddenRoomId, fixture.residentIds.c),
+          audit: await driver.readAccessAudit(),
+        };
+      };
+      const first = await runWorld("TEST-PRIVATE-CANARY:hidden-a");
+      const second = await runWorld("TEST-PRIVATE-CANARY:hidden-b");
+      const unauthorizedText = [
+        surfaceText(first.unauthorizedB),
+        surfaceText(second.unauthorizedB),
+        surfaceText(first.newResident),
+        surfaceText(second.newResident),
+        ...first.audit.unauthorizedReadResults,
+        ...second.audit.unauthorizedReadResults,
+      ].join("\n");
+      const canaries = ["TEST-PRIVATE-CANARY:hidden-a", "TEST-PRIVATE-CANARY:hidden-b"];
+      const leaks = canaries.filter((canary) => unauthorizedText.includes(canary));
+      if (surfaceText(first.unauthorizedB) !== surfaceText(second.unauthorizedB))
+        leaks.push("hidden-surface-difference:b");
+      if (surfaceText(first.newResident) !== surfaceText(second.newResident))
+        leaks.push("hidden-surface-difference:new-resident");
+      if (surfaceText(first.publicSurface) !== surfaceText(second.publicSurface))
+        leaks.push("hidden-surface-difference:public-view");
+      if (JSON.stringify(first.audit) !== JSON.stringify(second.audit))
+        leaks.push("hidden-audit-difference");
+      if (
+        first.audit.unauthorizedReadResults.length !== 2 ||
+        second.audit.unauthorizedReadResults.length !== 2 ||
+        [...first.audit.unauthorizedReadResults, ...second.audit.unauthorizedReadResults].some(
+          (result) => result !== "not-found",
+        )
+      ) {
+        leaks.push("unauthorized-read-attempts-missing-or-not-denied");
+      }
+      const auditReadCount =
+        first.audit.crossResidentPrivateReads + second.audit.crossResidentPrivateReads;
+      const newResidentReceivedHistoryByDefault = canaries.some((canary) =>
+        `${surfaceText(first.newResident)} ${surfaceText(second.newResident)}`.includes(canary),
+      );
+      return evaluateGroupChatEvidence(id, {
+        authorizedPublicSurface: [first.publicSurface.body].filter(Boolean),
+        unauthorizedSurfaceLeaks: leaks,
+        crossResidentPrivateReads: auditReadCount,
+        newResidentReceivedHistoryByDefault,
+        crossRoomReplayAccepted:
+          hasMarker(first.hiddenEvents, "TEST-GC15-CROSS-ROOM-REPLAY") ||
+          hasMarker(second.hiddenEvents, "TEST-GC15-CROSS-ROOM-REPLAY"),
+      });
     }
   }
 }

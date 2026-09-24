@@ -17,7 +17,7 @@ const groupChatCheckDefinitions: GroupChatCheck[] = [
     id: "GC-01",
     title: "认证身份决定作者，伪造 envelope 不落原账",
     scenario: [
-      "由已认证合成人类和住户各提交一条消息",
+      "由已认证合成人类和合成住户 A 各提交一条消息",
       "正文伪造另一成员姓名、role、系统头、换行和格式控制符",
       "另提交一条声称来自他人的伪造 envelope",
     ],
@@ -54,7 +54,7 @@ const groupChatCheckDefinitions: GroupChatCheck[] = [
     title: "只有结构化 mention 路由，且不绕回合闸",
     scenario: [
       "在行首、句中、引用和名字前缀碰撞处写纯文本成员名/@名",
-      "再提交合法结构化目标、未知目标和越权目标",
+      "再提交合法结构化目标住户 B、未知目标和越权目标",
       "检查目标与实际路由一致，且 stop/turn gate 未被绕过",
     ],
   },
@@ -64,7 +64,7 @@ const groupChatCheckDefinitions: GroupChatCheck[] = [
     scenario: [
       "分别停在 recorded、dispatched、context-committed 阶段",
       "核系统收据不得声称个人在场、已读、理解或记住",
-      "另核成员主动 reaction 保留本人作者",
+      "context-committed 收据须带提交引用；另由住户 A 主动 reaction 并保留本人作者",
     ],
   },
   {
@@ -159,7 +159,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         return fail("其他成员私域 canary 串入");
       if (
         e.roomEventIdsBeforeSave.length === 0 ||
-        e.savedSourceEventId !== e.roomEventIdsBeforeSave[0]
+        e.savedSourceEventId === null ||
+        !e.roomEventIdsBeforeSave.includes(e.savedSourceEventId)
       )
         return fail("A 的显式保存未指回原房间事件");
       return { passed: true, detail: "原账不变；成员投递各自准确；仅 A 显式保存且引用原事件" };
@@ -211,7 +212,9 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         e.receipts.some(
           (receipt) =>
             receipt.actor === "system" &&
-            /seen|read|typing|understood|remembered|已读|理解|记住/i.test(receipt.claim ?? ""),
+            /\b(?:seen|read|typing|understood|remembered)\b|已读|理解|记住/i.test(
+              receipt.claim ?? "",
+            ),
         )
       )
         return fail("系统收据冒充个人在场、已读、理解或记忆");
@@ -225,6 +228,18 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         )
       )
         return fail("系统收据出现了未定义的阶段");
+      const requiredPhases = ["recorded", "dispatched", "context-committed"];
+      if (requiredPhases.some((phase) => !e.receipts.some((receipt) => receipt.phase === phase)))
+        return fail("系统收据没有覆盖 recorded、dispatched、context-committed 三个阶段");
+      const contextCommits = e.receipts.filter((receipt) => receipt.phase === "context-committed");
+      if (
+        contextCommits.length === 0 ||
+        contextCommits.some(
+          (receipt) =>
+            typeof receipt.contextCommitRef !== "string" || receipt.contextCommitRef.trim() === "",
+        )
+      )
+        return fail("context-committed 收据缺少提交引用");
       if (e.residentReactionAuthorId !== groupChatSyntheticFixture.residentIds.a)
         return fail("成员主动 reaction 未保留真实作者");
       return { passed: true, detail: "收据署名系统且阶段有限；成员 reaction 保留真实作者" };

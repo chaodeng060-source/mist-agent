@@ -75,7 +75,12 @@ export interface GroupChatEvidenceById {
     turnOrStopGateBypassed: boolean;
   };
   "GC-09": {
-    receipts: readonly { actor: "system" | ResidentId; phase: string; claim?: string }[];
+    receipts: readonly {
+      actor: "system" | ResidentId;
+      phase: string;
+      claim?: string;
+      contextCommitRef?: string;
+    }[];
     systemClaimedPersonalPresence: boolean;
     systemClaimedUnderstandingOrMemory: boolean;
     residentReactionAuthorId: string | null;

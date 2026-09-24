@@ -59,6 +59,7 @@ const validEvidence: { [K in keyof GroupChatEvidenceById]: GroupChatEvidenceById
     receipts: [
       { actor: "system", phase: "recorded" },
       { actor: "system", phase: "dispatched" },
+      { actor: "system", phase: "context-committed", contextCommitRef: "ctx-commit:test-1" },
     ],
     systemClaimedPersonalPresence: false,
     systemClaimedUnderstandingOrMemory: false,
@@ -130,10 +131,89 @@ describe("#191 group-chat acceptance contract (synthetic harness self-test only)
     expect(result.passed).toBe(false);
   });
 
+  it("rejects GC-02 when a private canary appears on a public surface", () => {
+    const result = evaluateGroupChatEvidence("GC-02", {
+      ...validEvidence["GC-02"],
+      leakedCanaries: [groupChatSyntheticFixture.canaries.privateA],
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects GC-03 when a queued resident receives a personal memory write", () => {
+    const result = evaluateGroupChatEvidence("GC-03", {
+      ...validEvidence["GC-03"],
+      memoryWritesByResident: {
+        ...validEvidence["GC-03"].memoryWritesByResident,
+        "test-resident:b": 1,
+      },
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects GC-05 when plain-text mentions trigger a call", () => {
+    const result = evaluateGroupChatEvidence("GC-05", {
+      ...validEvidence["GC-05"],
+      callsFromTextOnlyMentions: 1,
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects GC-15 when a new resident receives history by default", () => {
+    const result = evaluateGroupChatEvidence("GC-15", {
+      ...validEvidence["GC-15"],
+      newResidentReceivedHistoryByDefault: true,
+    });
+    expect(result.passed).toBe(false);
+  });
+
   it("rejects a system receipt whose phase is outside the recorded delivery stages", () => {
     const result = evaluateGroupChatEvidence("GC-09", {
       ...validEvidence["GC-09"],
       receipts: [{ actor: "system", phase: "understood" }],
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects GC-09 if context-committed is missing", () => {
+    const result = evaluateGroupChatEvidence("GC-09", {
+      ...validEvidence["GC-09"],
+      receipts: validEvidence["GC-09"].receipts.slice(0, 2),
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("rejects GC-09 when only the recorded phase is present", () => {
+    const result = evaluateGroupChatEvidence("GC-09", {
+      ...validEvidence["GC-09"],
+      receipts: [{ actor: "system", phase: "recorded" }],
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it("does not treat words containing read as a read claim", () => {
+    const result = evaluateGroupChatEvidence("GC-09", {
+      ...validEvidence["GC-09"],
+      receipts: [
+        { actor: "system", phase: "recorded", claim: "ready" },
+        { actor: "system", phase: "dispatched", claim: "thread already open" },
+        {
+          actor: "system",
+          phase: "context-committed",
+          contextCommitRef: "ctx-commit:test-1",
+          claim: "commit recorded",
+        },
+      ],
+    });
+    expect(result.passed).toBe(true);
+  });
+
+  it("rejects GC-09 when the context commit has no reference", () => {
+    const result = evaluateGroupChatEvidence("GC-09", {
+      ...validEvidence["GC-09"],
+      receipts: [
+        ...validEvidence["GC-09"].receipts.slice(0, 2),
+        { actor: "system", phase: "context-committed" },
+      ],
     });
     expect(result.passed).toBe(false);
   });

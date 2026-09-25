@@ -32,14 +32,23 @@ import {
 
 interface TestOptions {
   readonly acceptForged?: boolean;
+  readonly dropForgedBodyPost?: boolean;
+  readonly trustBodyAuthorHeader?: boolean;
   readonly acceptInvalidPosts?: boolean;
   readonly wrongMemorySource?: boolean;
+  readonly noopSeedPrivate?: boolean;
+  readonly leakPrivateCanariesIntoRoom?: boolean;
   readonly noRosterVersionBump?: boolean;
+  readonly rosterSnapshotOmitsNewResident?: boolean;
   readonly bypassGate?: boolean;
+  readonly deadRouter?: boolean;
   readonly contextCommitRef?: string;
   readonly claimOverride?: string;
+  readonly publishFutureReceiptsEarly?: boolean;
   readonly skipRosterPath?: RosterPath;
   readonly leakHiddenToUnauthorized?: boolean;
+  readonly noHiddenRoom?: boolean;
+  readonly publicBodyX?: boolean;
   readonly acceptCrossRoomReplay?: boolean;
   readonly leakPrivateCanaries?: boolean;
   readonly skipDeliveryFor?: ResidentId;
@@ -100,6 +109,8 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   async perform(command: GroupChatCommand): Promise<void> {
     switch (command.kind) {
       case "post": {
+        if (this.options.dropForgedBodyPost && command.body.includes("TEST-GC01-BODY-FORGERY"))
+          return;
         const valid =
           command.roomId !== "" &&
           command.visibility === "public" &&
@@ -108,13 +119,21 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           command.claimedAuthorId === undefined;
         if (!valid && !this.options.acceptInvalidPosts && !this.options.acceptForged) return;
         const id = `event:${this.nextId++}`;
+        const bodyAuthor = this.options.trustBodyAuthorHeader
+          ? command.body.match(/^From:\s*([^\r\n]+)/mu)?.[1]
+          : undefined;
         const actualAuthor =
           command.claimedAuthorId && this.options.acceptForged
             ? command.claimedAuthorId
-            : command.principalId;
+            : (bodyAuthor ?? command.principalId);
+        const privateContext = this.privateContexts.get(command.principalId as ResidentId) ?? [];
         const body = command.privateFields
           ? `${command.body} ${command.privateFields.join(" ")}`
-          : command.body;
+          : this.options.leakPrivateCanariesIntoRoom &&
+              command.body === "TEST-GC02-VALID" &&
+              privateContext.length > 0
+            ? `${command.body} ${privateContext.join(" ")}`
+            : command.body;
         this.events.push({
           id,
           roomId: command.roomId,
@@ -136,6 +155,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         return;
       }
       case "seed-resident-private": {
+        if (this.options.noopSeedPrivate) return;
         const targets: ResidentId[] = this.options.leakPrivateCanaries
           ? [fixture.residentIds.a, fixture.residentIds.b, fixture.residentIds.c]
           : [command.residentId];
@@ -182,7 +202,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "structured-mention": {
         const validTarget = [...this.roster].includes(command.targetId as ResidentId);
         const gateClosed = this.gateStopped || !this.gateTurnOpen;
-        const rejected = gateClosed || !validTarget;
+        const rejected = gateClosed || !validTarget || this.options.deadRouter === true;
         const bypassed = gateClosed && this.options.bypassGate === true;
         this.routes.push({
           marker: command.body,
@@ -197,7 +217,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         this.gateStopped = command.stopped;
         this.gateTurnOpen = command.turnOpen;
         return;
-      case "record-and-dispatch": {
+      case "record-event": {
         const id = `event:${this.nextId++}`;
         this.events.push({
           id,
@@ -208,6 +228,20 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         });
         const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
         this.receipts.push({ actor: "system", phase: "recorded", claim });
+        if (this.options.publishFutureReceiptsEarly) {
+          this.receipts.push({ actor: "system", phase: "dispatched", claim });
+          this.receipts.push({
+            actor: "system",
+            phase: "context-committed",
+            claim: "仍不等于理解或记忆",
+            contextCommitRef: "context-commit:premature",
+          });
+        }
+        return;
+      }
+      case "dispatch-event": {
+        if (!this.events.some((event) => event.body.includes(command.eventMarker))) return;
+        const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
         this.receipts.push({ actor: "system", phase: "dispatched", claim });
         return;
       }
@@ -226,7 +260,15 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         this.reactions.push({ residentId: command.residentId, eventMarker: command.eventMarker });
         return;
       case "create-room":
+        if (this.options.noHiddenRoom && command.visibility === "hidden") return;
         this.rooms.set(command.roomId, { visibility: command.visibility, body: command.body });
+        this.events.push({
+          id: `event:${this.nextId++}`,
+          roomId: command.roomId,
+          authorId: "test-host:room-seed",
+          body: command.body,
+          visibility: command.visibility,
+        });
         return;
       case "replay-public-payload": {
         if (!this.options.acceptCrossRoomReplay) return;
@@ -275,7 +317,10 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     return (this.privateContexts.get(residentId) ?? []).join(" ");
   }
   async readRoster(): Promise<RosterSnapshot> {
-    return { version: this.rosterVersion, residentIds: [...this.roster] };
+    const residentIds = [...this.roster].filter(
+      (id) => !(this.options.rosterSnapshotOmitsNewResident && id === fixture.residentIds.newcomer),
+    );
+    return { version: this.rosterVersion, residentIds };
   }
   async readRosterPath(path: RosterPath): Promise<RosterProjection> {
     return this.projections.get(path) ?? { residentIds: [], humanIds: [] };
@@ -300,8 +345,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     const visibleEvents = this.events.filter(
       (event) => event.roomId === roomId && event.visibility === "public",
     );
+    const body = [room?.body, ...visibleEvents.map((event) => event.body)]
+      .filter((value): value is string => Boolean(value))
+      .join("\n");
     return {
-      body: room?.body ?? visibleEvents.map((event) => event.body).join(" "),
+      body: this.options.publicBodyX && roomId === fixture.roomId ? "x" : body,
       candidates: visibleEvents.map(({ id }) => id),
       count: visibleEvents.length,
       errorCode: room ? null : "not-found",
@@ -346,12 +394,42 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect(result.passed).toBe(false);
   });
 
+  it("requires the judge to send and read back a body that impersonates another author", async () => {
+    expect(
+      (await runGroupChatCheck("GC-01", new SyntheticGroupChatHost({ dropForgedBodyPost: true })))
+        .passed,
+    ).toBe(false);
+    expect(
+      (
+        await runGroupChatCheck(
+          "GC-01",
+          new SyntheticGroupChatHost({ trustBodyAuthorHeader: true }),
+        )
+      ).passed,
+    ).toBe(false);
+  });
+
   it("fails if malformed/private payload negatives are silently accepted", async () => {
     const result = await runGroupChatCheck(
       "GC-02",
       new SyntheticGroupChatHost({ acceptInvalidPosts: true }),
     );
     expect(result.passed).toBe(false);
+  });
+
+  it("seeds private draft/tool canaries, reads them for the sender, and rejects public leakage", async () => {
+    expect(
+      (await runGroupChatCheck("GC-02", new SyntheticGroupChatHost({ noopSeedPrivate: true })))
+        .passed,
+    ).toBe(false);
+    expect(
+      (
+        await runGroupChatCheck(
+          "GC-02",
+          new SyntheticGroupChatHost({ leakPrivateCanariesIntoRoom: true }),
+        )
+      ).passed,
+    ).toBe(false);
   });
 
   it("requires a personal-memory pointer to equal the exact judge-seeded room event", async () => {
@@ -366,6 +444,14 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     const result = await runGroupChatCheck(
       "GC-03",
       new SyntheticGroupChatHost({ leakPrivateCanaries: true }),
+    );
+    expect(result.passed).toBe(false);
+  });
+
+  it("requires each resident to read back its own judge-seeded private canary", async () => {
+    const result = await runGroupChatCheck(
+      "GC-03",
+      new SyntheticGroupChatHost({ noopSeedPrivate: true }),
     );
     expect(result.passed).toBe(false);
   });
@@ -394,6 +480,14 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect(result.passed).toBe(false);
   });
 
+  it("checks the roster membership list before and after addition, not just its version", async () => {
+    const result = await runGroupChatCheck(
+      "GC-04",
+      new SyntheticGroupChatHost({ rosterSnapshotOmitsNewResident: true }),
+    );
+    expect(result.passed).toBe(false);
+  });
+
   it("fails if a structured mention bypasses the stop/turn gate", async () => {
     const result = await runGroupChatCheck(
       "GC-05",
@@ -410,13 +504,25 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect(result.passed).toBe(false);
   });
 
+  it("requires one real route for a legitimate structured mention while the gate is open", async () => {
+    const result = await runGroupChatCheck(
+      "GC-05",
+      new SyntheticGroupChatHost({ deadRouter: true }),
+    );
+    expect(result.passed).toBe(false);
+  });
+
   it.each([
     ["👀", true],
+    ["👀 已装入，不代表理解", true],
     ["我看见了", true],
+    ["我看见了，不代表理解", true],
+    ["seen; does not mean the member understood", true],
     ["系统已收，成员尚未派发", false],
     ["已装入，不代表理解", false],
     ["仍不等于理解或记忆", false],
     ["does not mean the member understood", false],
+    ["成员尚未理解", false],
     ["typing", true],
     ["已读", true],
     ["ready; already; recorded", false],
@@ -432,8 +538,24 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect(result.passed).toBe(false);
   });
 
+  it("fails if later-stage receipts are visible before their host operations", async () => {
+    const result = await runGroupChatCheck(
+      "GC-09",
+      new SyntheticGroupChatHost({ publishFutureReceiptsEarly: true }),
+    );
+    expect(result.passed).toBe(false);
+  });
+
   it("runs claim probes through the judge/readback path", async () => {
-    for (const claim of ["👀", "我看见了", "typing", "已读"]) {
+    for (const claim of [
+      "👀",
+      "👀 已装入，不代表理解",
+      "我看见了",
+      "我看见了，不代表理解",
+      "seen; does not mean the member understood",
+      "typing",
+      "已读",
+    ]) {
       const result = await runGroupChatCheck(
         "GC-09",
         new SyntheticGroupChatHost({ claimOverride: claim }),
@@ -445,6 +567,7 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
       "已装入，不代表理解",
       "仍不等于理解或记忆",
       "does not mean the member understood",
+      "成员尚未理解",
       "ready; already; recorded",
     ]) {
       const result = await runGroupChatCheck(
@@ -476,6 +599,15 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
           new SyntheticGroupChatHost({ acceptCrossRoomReplay: true }),
         )
       ).passed,
+    ).toBe(false);
+  });
+
+  it("requires the hidden canary world and judge-seeded public readback to exist", async () => {
+    expect(
+      (await runGroupChatCheck("GC-15", new SyntheticGroupChatHost({ noHiddenRoom: true }))).passed,
+    ).toBe(false);
+    expect(
+      (await runGroupChatCheck("GC-15", new SyntheticGroupChatHost({ publicBodyX: true }))).passed,
     ).toBe(false);
   });
 

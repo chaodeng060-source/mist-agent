@@ -88,11 +88,12 @@ export type GroupChatCommand =
     }
   | { readonly kind: "set-turn-gate"; readonly stopped: boolean; readonly turnOpen: boolean }
   | {
-      readonly kind: "record-and-dispatch";
+      readonly kind: "record-event";
       readonly roomId: string;
       readonly authorId: string;
       readonly body: string;
     }
+  | { readonly kind: "dispatch-event"; readonly eventMarker: string }
   | { readonly kind: "commit-context"; readonly residentId: ResidentId; readonly marker: string }
   | { readonly kind: "react"; readonly residentId: ResidentId; readonly eventMarker: string }
   | {
@@ -174,6 +175,9 @@ export interface GroupChatEvidenceById {
     legitimateHuman: { accepted: boolean; authorId: string };
     legitimate: { accepted: boolean; authorId: string };
     forgedEnvelopeAccepted: boolean;
+    forgedBodyAccepted: boolean;
+    forgedBodyAuthorId: string | null;
+    unexpectedAuthors: readonly string[];
     recordedAuthorIds: readonly string[];
   };
   "GC-02": {
@@ -182,6 +186,7 @@ export interface GroupChatEvidenceById {
     missingRoomAccepted: boolean;
     missingBindingAccepted: boolean;
     extraPrivateFieldsAccepted: boolean;
+    senderPrivateCanariesMissing: readonly string[];
     leakedCanaries: readonly string[];
   };
   "GC-03": {
@@ -190,6 +195,7 @@ export interface GroupChatEvidenceById {
     deliveryByResident: Readonly<Partial<Record<ResidentId, DeliveryState | "missing">>>;
     deliveryRowsRead: number;
     memoryWritesByResident: Readonly<Partial<Record<ResidentId, number>>>;
+    privateCanariesMissingFromOwners: readonly string[];
     privateCanariesVisibleToOtherResidents: readonly string[];
     judgeSeededEventId: string | null;
     savedSourceEventId: string | null;
@@ -197,6 +203,8 @@ export interface GroupChatEvidenceById {
   "GC-04": {
     rosterVersionBefore: number;
     rosterVersionAfter: number;
+    rosterResidentIdsBefore: readonly ResidentId[];
+    rosterResidentIdsAfter: readonly ResidentId[];
     expectedNewResidentId: ResidentId;
     residentIdsByPath: Readonly<Record<RosterPath, readonly ResidentId[]>>;
     hardCodedResidentBranchFound: boolean;
@@ -206,6 +214,7 @@ export interface GroupChatEvidenceById {
     callsFromTextOnlyMentions: number;
     structuredTargetId: ResidentId;
     routedResidentId: ResidentId | null;
+    legitimateStructuredRouteAccepted: boolean;
     unknownTargetRejected: boolean;
     unauthorizedTargetRejected: boolean;
     turnOrStopGateBypassed: boolean;
@@ -219,11 +228,13 @@ export interface GroupChatEvidenceById {
     }[];
     systemClaimedPersonalPresence: boolean;
     systemClaimedUnderstandingOrMemory: boolean;
+    prematureReceiptPhases: readonly string[];
     judgeSeededContextCommitId: string | null;
     residentReactionAuthorId: string | null;
   };
   "GC-15": {
-    authorizedPublicSurface: readonly string[];
+    authorizedPublicSurface: string;
+    hiddenWorldSeedsPresent: boolean;
     unauthorizedSurfaceLeaks: readonly string[];
     crossResidentPrivateReads: number;
     newResidentReceivedHistoryByDefault: boolean;

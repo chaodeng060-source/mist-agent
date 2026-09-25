@@ -172,7 +172,9 @@ export function isUnsupportedPersonalClaim(claim: string): boolean {
           prefix,
         );
       const chinesePrefix = prefix.trimEnd();
-      const directlyDeniedInChinese = /(?:没有|没|并未|尚未|未|不)$/u.test(chinesePrefix);
+      const directlyDeniedInChinese = /(?:没有|没|并未|尚未|未必|不一定|未|不)$/u.test(
+        chinesePrefix,
+      );
       const shortSubjectDenialInChinese =
         /(?:并不代表|不代表|并不等于|不等于|并不表示|不表示|并不说明|不说明|并不证明|不证明)(?:当前成员|这个成员|该成员|成员|本人|对方|这个人|我|你|他|她)?$/u.test(
           chinesePrefix,

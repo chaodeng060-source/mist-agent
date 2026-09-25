@@ -171,11 +171,22 @@ export function isUnsupportedPersonalClaim(claim: string): boolean {
         /\b(?:does\s+not|doesn't|did\s+not|didn't|do\s+not|don't|not|never|is\s+not|isn't|was\s+not|wasn't|were\s+not|weren't|has\s+not|hasn't|have\s+not|haven't|had\s+not|hadn't)\s+(?:necessarily\s+)?(?:(?:mean|show|prove|indicate)\s+(?:that\s+)?)?(?:(?:the\s+)?(?:member\s+)?)?(?:has\s+|have\s+|been\s+|the\s+)?$/iu.test(
           prefix,
         );
-      const directlyDeniedInChinese =
-        /(?:不代表|并不代表|不等于|并不等于|不表示|并不表示|不说明|并不说明|不证明|并不证明|尚未|并未|未必|不一定|没有|没|不).{0,12}$/u.test(
-          prefix,
+      const chinesePrefix = prefix.trimEnd();
+      const directlyDeniedInChinese = /(?:没有|没|并未|尚未|未|不)$/u.test(chinesePrefix);
+      const shortSubjectDenialInChinese =
+        /(?:并不代表|不代表|并不等于|不等于|并不表示|不表示|并不说明|不说明|并不证明|不证明)(?:当前成员|这个成员|该成员|成员|本人|对方|这个人|我|你|他|她)?$/u.test(
+          chinesePrefix,
         );
-      return !directlyDeniedInEnglish && !directlyDeniedInChinese;
+      const coordinatedDenialInChinese =
+        /(?:并不代表|不代表|并不等于|不等于|并不表示|不表示|并不说明|不说明|并不证明|不证明)(?:当前成员|这个成员|该成员|成员|本人|对方|这个人|我|你|他|她)?(?:看见|看到|已读|阅读|输入|打字|理解|记住|记忆)(?:或者|以及|或|和|与|及|、)$/u.test(
+          chinesePrefix,
+        );
+      return (
+        !directlyDeniedInEnglish &&
+        !directlyDeniedInChinese &&
+        !shortSubjectDenialInChinese &&
+        !coordinatedDenialInChinese
+      );
     });
 
   const presenceClaim =

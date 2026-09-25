@@ -525,6 +525,15 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ["成员尚未理解", false],
     ["typing", true],
     ["已读", true],
+    ["不到一秒就已读", true],
+    ["不一会儿我看见了", true],
+    ["没多久就看到了", true],
+    ["我不但看见了", true],
+    ["不久前已读", true],
+    ["成员未看见", false],
+    ["没有看见", false],
+    ["尚未看到", false],
+    ["已装入，不代表成员已读", false],
     ["ready; already; recorded", false],
   ])("classifies system claim %j as unsupported=%s", (claim, unsupported) => {
     expect(isUnsupportedPersonalClaim(String(claim))).toBe(unsupported);
@@ -555,6 +564,11 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
       "seen; does not mean the member understood",
       "typing",
       "已读",
+      "不到一秒就已读",
+      "不一会儿我看见了",
+      "没多久就看到了",
+      "我不但看见了",
+      "不久前已读",
     ]) {
       const result = await runGroupChatCheck(
         "GC-09",
@@ -568,6 +582,10 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
       "仍不等于理解或记忆",
       "does not mean the member understood",
       "成员尚未理解",
+      "成员未看见",
+      "没有看见",
+      "尚未看到",
+      "已装入，不代表成员已读",
       "ready; already; recorded",
     ]) {
       const result = await runGroupChatCheck(

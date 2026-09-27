@@ -1,6 +1,12 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  type GroupChatJudgeContext,
+  evaluateGroupChatEvidence,
   groupChatChecks,
+  isPersonalStatePhase,
   isUnsupportedPersonalClaim,
   runGroupChatCheck,
 } from "./group-chat-checks.ts";
@@ -26,6 +32,8 @@ import {
   groupChatSyntheticFixture as fixture,
 } from "./group-chat-driver.ts";
 import {
+  findSourceLiterals,
+  hostProvenanceProblem,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
 } from "./group-chat-run.ts";
@@ -40,19 +48,35 @@ interface TestOptions {
   readonly leakPrivateCanariesIntoRoom?: boolean;
   readonly noRosterVersionBump?: boolean;
   readonly rosterSnapshotOmitsNewResident?: boolean;
+  readonly projectionsHardcode?: ResidentId;
   readonly bypassGate?: boolean;
   readonly deadRouter?: boolean;
   readonly contextCommitRef?: string;
   readonly claimOverride?: string;
   readonly publishFutureReceiptsEarly?: boolean;
+  readonly extraSystemPhase?: string;
+  readonly proxyReaction?: boolean;
+  readonly commitWritesMemory?: boolean;
+  readonly residentReceiptAfterReaction?: boolean;
+  readonly forgedResidentReceipt?: boolean;
   readonly skipRosterPath?: RosterPath;
   readonly leakHiddenToUnauthorized?: boolean;
+  readonly revealHiddenExistence?: boolean;
   readonly noHiddenRoom?: boolean;
   readonly publicBodyX?: boolean;
   readonly acceptCrossRoomReplay?: boolean;
+  readonly newResidentGetsHistory?: boolean;
+  readonly leakResidentScope?: boolean;
+  readonly silentScopeRead?: boolean;
   readonly leakPrivateCanaries?: boolean;
   readonly skipDeliveryFor?: ResidentId;
   readonly routePlainText?: boolean;
+  readonly routeBareName?: boolean;
+  readonly resolvePlainTextTarget?: boolean;
+  readonly omitPlainRows?: boolean;
+  readonly omitRefusedRows?: boolean;
+  readonly holdGatedMentions?: boolean;
+  readonly acceptUnknownTargetWithoutCall?: boolean;
 }
 
 /** Test-only host model; production runner never imports this adapter. */
@@ -60,10 +84,14 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   readonly kind = "mist-host" as const;
   readonly options: TestOptions;
   private events: RoomEvent[] = [];
+  private eventTime = new Map<string, number>();
+  private roomCounters = new Map<string, number>();
+  private clock = 1;
   private deliveries = new Map<string, DeliveryRecord[]>();
   private memories: MemoryRecord[] = [];
   private privateContexts = new Map<ResidentId, string[]>();
   private roster = new Set<ResidentId>([fixture.residentIds.a, fixture.residentIds.b]);
+  private joinedAt = new Map<ResidentId, number>();
   private rosterVersion = 1;
   private projections = new Map<RosterPath, RosterProjection>();
   private routes: RouteRecord[] = [];
@@ -75,7 +103,6 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private gateTurnOpen = true;
   private crossResidentPrivateReads = 0;
   private unauthorizedReadResults: string[] = [];
-  private nextId = 1;
 
   constructor(options: TestOptions = {}) {
     this.options = options;
@@ -88,10 +115,17 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
 
   async resetScenario(_id: GroupChatCheckId): Promise<void> {
     this.events = [];
+    this.eventTime.clear();
+    this.roomCounters.clear();
+    this.clock = 1;
     this.deliveries.clear();
     this.memories = [];
     this.privateContexts.clear();
     this.roster = new Set([fixture.residentIds.a, fixture.residentIds.b]);
+    this.joinedAt = new Map<ResidentId, number>([
+      [fixture.residentIds.a, 0],
+      [fixture.residentIds.b, 0],
+    ]);
     this.rosterVersion = 1;
     this.projections.clear();
     this.routes = [];
@@ -103,7 +137,15 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     this.gateTurnOpen = true;
     this.crossResidentPrivateReads = 0;
     this.unauthorizedReadResults = [];
-    this.nextId = 1;
+  }
+
+  /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
+  private addEvent(event: Omit<RoomEvent, "id">): void {
+    const next = (this.roomCounters.get(event.roomId) ?? 0) + 1;
+    this.roomCounters.set(event.roomId, next);
+    const id = `event:${event.roomId}#${next}`;
+    this.eventTime.set(id, this.clock++);
+    this.events.push({ ...event, id });
   }
 
   async perform(command: GroupChatCommand): Promise<void> {
@@ -118,7 +160,6 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           command.privateFields === undefined &&
           command.claimedAuthorId === undefined;
         if (!valid && !this.options.acceptInvalidPosts && !this.options.acceptForged) return;
-        const id = `event:${this.nextId++}`;
         const bodyAuthor = this.options.trustBodyAuthorHeader
           ? command.body.match(/^From:\s*([^\r\n]+)/mu)?.[1]
           : undefined;
@@ -134,8 +175,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
               privateContext.length > 0
             ? `${command.body} ${privateContext.join(" ")}`
             : command.body;
-        this.events.push({
-          id,
+        this.addEvent({
           roomId: command.roomId,
           authorId: actualAuthor,
           body,
@@ -178,22 +218,34 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "register-resident":
         if (!this.roster.has(command.residentId)) {
           this.roster.add(command.residentId);
+          this.joinedAt.set(command.residentId, this.clock);
           if (!this.options.noRosterVersionBump) this.rosterVersion += 1;
         }
         return;
-      case "exercise-roster-path":
+      case "exercise-roster-path": {
         if (this.options.skipRosterPath === command.path) return;
-        this.projections.set(command.path, {
-          residentIds: [...this.roster],
-          humanIds: [fixture.humanId],
-        });
+        const hardcoded = this.options.projectionsHardcode;
+        const residentIds =
+          hardcoded === undefined
+            ? [...this.roster]
+            : [...this.roster].filter(
+                (id) =>
+                  id === fixture.residentIds.a || id === fixture.residentIds.b || id === hardcoded,
+              );
+        this.projections.set(command.path, { residentIds, humanIds: [fixture.humanId] });
         return;
+      }
       case "plain-text-mention": {
-        const marker = command.body.split(" ")[0] ?? "";
+        if (this.options.omitPlainRows) return;
+        const marker = command.body.split(/\s/u)[0] ?? "";
+        const target = fixture.residentIds.b;
+        const bareName = command.body.replaceAll(`@${target}`, "").includes(target);
+        const routed =
+          this.options.routePlainText === true || (this.options.routeBareName === true && bareName);
         this.routes.push({
           marker,
-          calls: this.options.routePlainText ? 1 : 0,
-          targetId: null,
+          calls: routed ? 1 : 0,
+          targetId: this.options.resolvePlainTextTarget ? target : null,
           rejected: false,
           gateBypassed: false,
         });
@@ -202,8 +254,29 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       case "structured-mention": {
         const validTarget = [...this.roster].includes(command.targetId as ResidentId);
         const gateClosed = this.gateStopped || !this.gateTurnOpen;
+        if (!validTarget && !gateClosed && this.options.acceptUnknownTargetWithoutCall) {
+          this.routes.push({
+            marker: command.body,
+            calls: 0,
+            targetId: command.targetId,
+            rejected: false,
+            gateBypassed: false,
+          });
+          return;
+        }
+        if (gateClosed && validTarget && this.options.holdGatedMentions) {
+          this.routes.push({
+            marker: command.body,
+            calls: 0,
+            targetId: command.targetId,
+            rejected: false,
+            gateBypassed: false,
+          });
+          return;
+        }
         const rejected = gateClosed || !validTarget || this.options.deadRouter === true;
         const bypassed = gateClosed && this.options.bypassGate === true;
+        if (rejected && !bypassed && this.options.omitRefusedRows) return;
         this.routes.push({
           marker: command.body,
           calls: rejected && !bypassed ? 0 : 1,
@@ -218,9 +291,7 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         this.gateTurnOpen = command.turnOpen;
         return;
       case "record-event": {
-        const id = `event:${this.nextId++}`;
-        this.events.push({
-          id,
+        this.addEvent({
           roomId: command.roomId,
           authorId: command.authorId,
           body: command.body,
@@ -241,12 +312,28 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       }
       case "dispatch-event": {
         if (!this.events.some((event) => event.body.includes(command.eventMarker))) return;
-        const claim = this.options.claimOverride ?? "系统已收，成员尚未派发";
+        const claim = this.options.claimOverride ?? "已派发，尚未装入成员上下文";
         this.receipts.push({ actor: "system", phase: "dispatched", claim });
+        if (this.options.extraSystemPhase !== undefined) {
+          this.receipts.push({
+            actor: "system",
+            phase: this.options.extraSystemPhase,
+            claim: "排队等待装入",
+          });
+        }
+        if (this.options.proxyReaction) {
+          this.reactions.push({
+            residentId: fixture.residentIds.a,
+            eventMarker: command.eventMarker,
+          });
+        }
+        if (this.options.forgedResidentReceipt) {
+          this.receipts.push({ actor: fixture.residentIds.b, phase: "reaction" });
+        }
         return;
       }
       case "commit-context": {
-        const id = `context-commit:${this.nextId++}`;
+        const id = `context-commit:${this.clock++}`;
         this.commits.push({ id, residentId: command.residentId, marker: command.marker });
         this.receipts.push({
           actor: "system",
@@ -254,16 +341,25 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           claim: this.options.claimOverride ?? "已装入，不代表理解",
           contextCommitRef: this.options.contextCommitRef ?? id,
         });
+        if (this.options.commitWritesMemory) {
+          this.memories.push({
+            residentId: command.residentId,
+            sourceEventId: null,
+            body: command.marker,
+          });
+        }
         return;
       }
       case "react":
         this.reactions.push({ residentId: command.residentId, eventMarker: command.eventMarker });
+        if (this.options.residentReceiptAfterReaction) {
+          this.receipts.push({ actor: command.residentId, phase: "reaction" });
+        }
         return;
       case "create-room":
         if (this.options.noHiddenRoom && command.visibility === "hidden") return;
         this.rooms.set(command.roomId, { visibility: command.visibility, body: command.body });
-        this.events.push({
-          id: `event:${this.nextId++}`,
+        this.addEvent({
           roomId: command.roomId,
           authorId: "test-host:room-seed",
           body: command.body,
@@ -278,10 +374,10 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         );
         const target = this.rooms.get(command.targetRoomId);
         if (source && target) {
-          this.events.push({
-            ...source,
-            id: `event:${this.nextId++}`,
+          this.addEvent({
             roomId: command.targetRoomId,
+            authorId: source.authorId,
+            body: source.body,
             visibility: target.visibility,
           });
         }
@@ -295,6 +391,16 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           if (this.options.leakHiddenToUnauthorized) this.crossResidentPrivateReads += 1;
         }
         if (room?.visibility === "hidden" && allowed) this.crossResidentPrivateReads += 1;
+        return;
+      }
+      case "attempt-resident-scope-read": {
+        if (this.options.silentScopeRead) return;
+        this.unauthorizedReadResults.push("not-found");
+        if (this.options.leakResidentScope) {
+          const owner = this.privateContexts.get(command.ownerId) ?? [];
+          const viewer = this.privateContexts.get(command.viewerId) ?? [];
+          this.privateContexts.set(command.viewerId, [...viewer, ...owner]);
+        }
         return;
       }
       case "set-resident":
@@ -340,10 +446,24 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       if (this.options.leakHiddenToUnauthorized) {
         return { body: room.body, candidates: [], count: 1, errorCode: null, receipt: null };
       }
-      return { body: "", candidates: [], count: 0, errorCode: "not-found", receipt: null };
+      return {
+        body: "",
+        candidates: [],
+        count: 0,
+        errorCode: this.options.revealHiddenExistence ? "forbidden" : "not-found",
+        receipt: null,
+      };
     }
+    // A resident sees room history from its join time; the owner and outsiders keep the
+    // pre-existing all-public view.
+    const joined = this.options.newResidentGetsHistory
+      ? undefined
+      : this.joinedAt.get(viewerId as ResidentId);
     const visibleEvents = this.events.filter(
-      (event) => event.roomId === roomId && event.visibility === "public",
+      (event) =>
+        event.roomId === roomId &&
+        event.visibility === "public" &&
+        (joined === undefined || (this.eventTime.get(event.id) ?? 0) >= joined),
     );
     const body = [room?.body, ...visibleEvents.map((event) => event.body)]
       .filter((value): value is string => Boolean(value))
@@ -367,6 +487,74 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   }
 }
 
+/** No member-id literals found under src/ (the runner supplies the real scan). */
+const judge: GroupChatJudgeContext = { findSourceLiterals: async () => [] };
+
+const check = (id: GroupChatCheckId, options: TestOptions = {}) =>
+  runGroupChatCheck(id, new SyntheticGroupChatHost(options), judge);
+
+/** Explicit personal-state assertions the system must never make on a member's behalf. */
+const unsupportedClaims = [
+  "👀",
+  "👀 已装入，不代表理解",
+  "已发送👀",
+  "我看见了",
+  "我看见了，不代表理解",
+  "seen; does not mean the member understood",
+  "the member has read it",
+  "typing",
+  "对方正在输入…",
+  "输入中…",
+  "已读",
+  "系统已收，成员已读",
+  "不代表理解，但已读",
+  "不到一秒就已读",
+  "不一会儿我看见了",
+  "没多久就看到了",
+  "我不但看见了",
+  "不久前已读",
+  "成员已理解",
+  "成员已经记住",
+  "记住了",
+  "已写入记忆",
+  "写入了长期记忆",
+];
+
+/**
+ * Honest wording must stay green: bare verbs used in denials, the design doc's own sentence,
+ * and every example the #202 review showed being misread as an impersonation.
+ */
+const honestClaims = [
+  "系统已收，成员尚未派发",
+  "已装入，不代表理解",
+  "仍不等于理解或记忆",
+  "does not mean the member understood",
+  "成员尚未理解",
+  "成员未看见",
+  "成员不一定看到",
+  "成员未必看见",
+  "没有看见",
+  "尚未看到",
+  "已装入，不代表成员已读",
+  "不代表已读、理解",
+  "ready; already; recorded",
+  "not read yet",
+  "has not been read",
+  "等待用户输入",
+  "请在下方输入",
+  "输入法",
+  "输入中文不受影响",
+  "系统不写入记忆",
+  "未写入记忆",
+  "已装入，尚未形成记忆",
+  "装入也不证明住户理解、认同、回复或写入记忆",
+  "已装入，不证明写入记忆",
+  "没有👀",
+  "系统不发送👀",
+  "系统已读取配置",
+  "以 read-only 方式装入",
+];
+
 describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
   it("freezes exactly the seven PR1 lamps and synthetic fixtures", () => {
     expect(groupChatChecks.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
@@ -381,256 +569,279 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
 
   it("passes positive controls only after judge operations and independent readbacks", async () => {
     for (const id of GROUP_CHAT_CHECK_IDS) {
-      const result = await runGroupChatCheck(id, new SyntheticGroupChatHost());
+      const result = await check(id);
       expect(result.passed, `${id}: ${result.detail}`).toBe(true);
     }
   });
 
-  it("fails if the forged-envelope negative is silently accepted", async () => {
-    const result = await runGroupChatCheck(
-      "GC-01",
-      new SyntheticGroupChatHost({ acceptForged: true }),
-    );
+  // Each negative must go red for its own reason, not trip an earlier, unrelated gate.
+  it.each([
+    ["GC-01", { acceptForged: true }, "伪造 envelope"],
+    ["GC-01", { dropForgedBodyPost: true }, "正文身份伪造负例"],
+    ["GC-01", { trustBodyAuthorHeader: true }, "正文身份伪造负例"],
+    ["GC-02", { acceptInvalidPosts: true }, "缺显式边界"],
+    ["GC-02", { noopSeedPrivate: true }, "发送方私有"],
+    ["GC-02", { leakPrivateCanariesIntoRoom: true }, "泄漏"],
+    ["GC-03", { wrongMemorySource: true }, "指回原房间事件"],
+    ["GC-03", { leakPrivateCanaries: true }, "串入"],
+    ["GC-03", { noopSeedPrivate: true }, "读回本人"],
+    ["GC-03", { skipDeliveryFor: fixture.residentIds.b }, "三条"],
+    ["GC-04", { noRosterVersionBump: true }, "版本没有递增"],
+    ["GC-04", { skipRosterPath: "feedback" }, "未贯通"],
+    ["GC-04", { rosterSnapshotOmitsNewResident: true }, "未读回完整成员名单"],
+    ["GC-04", { projectionsHardcode: fixture.residentIds.newcomer }, "novel-e"],
+    ["GC-05", { bypassGate: true }, "绕过"],
+    ["GC-05", { routePlainText: true }, "触发了调用"],
+    ["GC-05", { routeBareName: true }, "触发了调用"],
+    ["GC-05", { resolvePlainTextTarget: true }, "解析成了呼叫目标"],
+    ["GC-05", { deadRouter: true }, "恰好路由一次"],
+    ["GC-05", { acceptUnknownTargetWithoutCall: true }, "未知或越权目标"],
+    ["GC-09", { contextCommitRef: "x" }, "提交引用"],
+    ["GC-09", { publishFutureReceiptsEarly: true }, "提前出现"],
+    ["GC-09", { proxyReaction: true }, "代发"],
+    ["GC-09", { commitWritesMemory: true }, "写入记忆"],
+    ["GC-09", { extraSystemPhase: "seen" }, "个人状态当成了阶段"],
+    ["GC-09", { forgedResidentReceipt: true }, "没有本人 reaction"],
+    ["GC-15", { leakHiddenToUnauthorized: true }, "泄漏"],
+    ["GC-15", { acceptCrossRoomReplay: true }, "错误房间"],
+    ["GC-15", { noHiddenRoom: true }, "对照世界"],
+    ["GC-15", { publicBodyX: true }, "授权公开表面"],
+    ["GC-15", { revealHiddenExistence: true }, "hidden-existence-difference"],
+    ["GC-15", { leakResidentScope: true }, "内部 scope"],
+    ["GC-15", { silentScopeRead: true }, "恰好一次拒绝"],
+    ["GC-15", { newResidentGetsHistory: true }, "入群前"],
+  ] as const)("%s goes red for its own reason under %j", async (id, options, reason) => {
+    const result = await check(id, options);
     expect(result.passed).toBe(false);
+    expect(result.detail).toContain(reason);
+  });
+
+  it("fails if the forged-envelope negative is silently accepted", async () => {
+    expect((await check("GC-01", { acceptForged: true })).passed).toBe(false);
   });
 
   it("requires the judge to send and read back a body that impersonates another author", async () => {
+    expect((await check("GC-01", { dropForgedBodyPost: true })).passed).toBe(false);
+    expect((await check("GC-01", { trustBodyAuthorHeader: true })).passed).toBe(false);
+  });
+
+  it("counts recorded authors as a multiset, not by inclusion", () => {
+    const base = {
+      legitimateHuman: { accepted: true, authorId: fixture.humanId },
+      legitimate: { accepted: true, authorId: fixture.residentIds.a },
+      forgedEnvelopeAccepted: false,
+      forgedBodyAccepted: true,
+      forgedBodyAuthorId: fixture.residentIds.a,
+      unexpectedAuthors: [],
+    };
+    const { humanId } = fixture;
+    const { a } = fixture.residentIds;
     expect(
-      (await runGroupChatCheck("GC-01", new SyntheticGroupChatHost({ dropForgedBodyPost: true })))
-        .passed,
-    ).toBe(false);
-    expect(
-      (
-        await runGroupChatCheck(
-          "GC-01",
-          new SyntheticGroupChatHost({ trustBodyAuthorHeader: true }),
-        )
-      ).passed,
-    ).toBe(false);
+      evaluateGroupChatEvidence("GC-01", { ...base, recordedAuthorIds: [humanId, a, a] }).passed,
+    ).toBe(true);
+    const skewed = evaluateGroupChatEvidence("GC-01", {
+      ...base,
+      recordedAuthorIds: [humanId, humanId, a],
+    });
+    expect(skewed.passed).toBe(false);
+    expect(skewed.detail).toContain("三条");
   });
 
   it("fails if malformed/private payload negatives are silently accepted", async () => {
-    const result = await runGroupChatCheck(
-      "GC-02",
-      new SyntheticGroupChatHost({ acceptInvalidPosts: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-02", { acceptInvalidPosts: true })).passed).toBe(false);
   });
 
   it("seeds private draft/tool canaries, reads them for the sender, and rejects public leakage", async () => {
-    expect(
-      (await runGroupChatCheck("GC-02", new SyntheticGroupChatHost({ noopSeedPrivate: true })))
-        .passed,
-    ).toBe(false);
-    expect(
-      (
-        await runGroupChatCheck(
-          "GC-02",
-          new SyntheticGroupChatHost({ leakPrivateCanariesIntoRoom: true }),
-        )
-      ).passed,
-    ).toBe(false);
+    expect((await check("GC-02", { noopSeedPrivate: true })).passed).toBe(false);
+    expect((await check("GC-02", { leakPrivateCanariesIntoRoom: true })).passed).toBe(false);
   });
 
   it("requires a personal-memory pointer to equal the exact judge-seeded room event", async () => {
-    const result = await runGroupChatCheck(
-      "GC-03",
-      new SyntheticGroupChatHost({ wrongMemorySource: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-03", { wrongMemorySource: true })).passed).toBe(false);
   });
 
   it("fails GC-03 when judge-seeded private canaries cross resident contexts", async () => {
-    const result = await runGroupChatCheck(
-      "GC-03",
-      new SyntheticGroupChatHost({ leakPrivateCanaries: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-03", { leakPrivateCanaries: true })).passed).toBe(false);
   });
 
   it("requires each resident to read back its own judge-seeded private canary", async () => {
-    const result = await runGroupChatCheck(
-      "GC-03",
-      new SyntheticGroupChatHost({ noopSeedPrivate: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-03", { noopSeedPrivate: true })).passed).toBe(false);
   });
 
   it("fails GC-03 when a delivery ledger setup/readback is omitted", async () => {
-    const result = await runGroupChatCheck(
-      "GC-03",
-      new SyntheticGroupChatHost({ skipDeliveryFor: fixture.residentIds.b }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-03", { skipDeliveryFor: fixture.residentIds.b })).passed).toBe(false);
+  });
+
+  it("says GC-03 only covers separated ledger readback, not delivery semantics", async () => {
+    const result = await check("GC-03");
+    expect(result.passed).toBe(true);
+    expect(result.detail).toContain("投递语义留待投递账阶段");
   });
 
   it("checks roster version relatively and detects a non-incrementing add", async () => {
-    const result = await runGroupChatCheck(
-      "GC-04",
-      new SyntheticGroupChatHost({ noRosterVersionBump: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-04", { noRosterVersionBump: true })).passed).toBe(false);
   });
 
   it("fails if any newly added resident projection path is skipped", async () => {
-    const result = await runGroupChatCheck(
-      "GC-04",
-      new SyntheticGroupChatHost({ skipRosterPath: "feedback" }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-04", { skipRosterPath: "feedback" })).passed).toBe(false);
   });
 
   it("checks the roster membership list before and after addition, not just its version", async () => {
-    const result = await runGroupChatCheck(
-      "GC-04",
-      new SyntheticGroupChatHost({ rosterSnapshotOmitsNewResident: true }),
-    );
+    expect((await check("GC-04", { rosterSnapshotOmitsNewResident: true })).passed).toBe(false);
+  });
+
+  it("catches a roster path hard-wired to one newcomer by adding a different one", async () => {
+    const result = await check("GC-04", { projectionsHardcode: fixture.residentIds.newcomer });
     expect(result.passed).toBe(false);
+    expect(result.detail).toContain(fixture.residentIds.newcomerAlt);
+  });
+
+  it("fails GC-04 when src/ spells out a member id, and scans for every fixture member", async () => {
+    let scanned: readonly string[] = [];
+    const result = await runGroupChatCheck("GC-04", new SyntheticGroupChatHost(), {
+      findSourceLiterals: async (terms) => {
+        scanned = terms;
+        return ["src/group-chat/router.ts"];
+      },
+    });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("src/group-chat/router.ts");
+    expect(scanned).toEqual(
+      expect.arrayContaining([
+        fixture.humanId,
+        fixture.residentIds.a,
+        fixture.residentIds.newcomer,
+        fixture.residentIds.newcomerAlt,
+      ]),
+    );
+  });
+
+  it("refuses to judge GC-04 without the judge-side static scan", async () => {
+    await expect(runGroupChatCheck("GC-04", new SyntheticGroupChatHost())).rejects.toThrow(
+      /findSourceLiterals/,
+    );
   });
 
   it("fails if a structured mention bypasses the stop/turn gate", async () => {
-    const result = await runGroupChatCheck(
-      "GC-05",
-      new SyntheticGroupChatHost({ bypassGate: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-05", { bypassGate: true })).passed).toBe(false);
   });
 
   it("fails if any plain-text mention variant routes a call", async () => {
-    const result = await runGroupChatCheck(
-      "GC-05",
-      new SyntheticGroupChatHost({ routePlainText: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-05", { routePlainText: true })).passed).toBe(false);
+  });
+
+  it("covers bare member names, not only @name, in the plain-text negatives", async () => {
+    expect((await check("GC-05", { routeBareName: true })).passed).toBe(false);
+  });
+
+  it("fails if plain text is resolved to a call target even without a call", async () => {
+    expect((await check("GC-05", { resolvePlainTextTarget: true })).passed).toBe(false);
   });
 
   it("requires one real route for a legitimate structured mention while the gate is open", async () => {
-    const result = await runGroupChatCheck(
-      "GC-05",
-      new SyntheticGroupChatHost({ deadRouter: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-05", { deadRouter: true })).passed).toBe(false);
   });
 
-  it.each([
-    ["👀", true],
-    ["👀 已装入，不代表理解", true],
-    ["我看见了", true],
-    ["我看见了，不代表理解", true],
-    ["seen; does not mean the member understood", true],
-    ["系统已收，成员尚未派发", false],
-    ["已装入，不代表理解", false],
-    ["仍不等于理解或记忆", false],
-    ["does not mean the member understood", false],
-    ["成员尚未理解", false],
-    ["typing", true],
-    ["已读", true],
-    ["不到一秒就已读", true],
-    ["不一会儿我看见了", true],
-    ["没多久就看到了", true],
-    ["我不但看见了", true],
-    ["不久前已读", true],
-    ["成员未看见", false],
-    ["成员不一定看到", false],
-    ["成员未必看见", false],
-    ["没有看见", false],
-    ["尚未看到", false],
-    ["已装入，不代表成员已读", false],
-    ["ready; already; recorded", false],
-  ])("classifies system claim %j as unsupported=%s", (claim, unsupported) => {
-    expect(isUnsupportedPersonalClaim(String(claim))).toBe(unsupported);
+  it("treats a missing route row as zero calls (the review's empty-routes probe)", async () => {
+    const result = await check("GC-05", { omitPlainRows: true, omitRefusedRows: true });
+    expect(result.passed, result.detail).toBe(true);
+  });
+
+  it("lets a closed gate hold a mention without calling it", async () => {
+    const result = await check("GC-05", { holdGatedMentions: true });
+    expect(result.passed, result.detail).toBe(true);
+  });
+
+  it("fails if an unknown target is accepted even when no call is made", async () => {
+    expect((await check("GC-05", { acceptUnknownTargetWithoutCall: true })).passed).toBe(false);
+  });
+
+  it.each(unsupportedClaims)("flags system claim %j as an unsupported personal claim", (claim) => {
+    expect(isUnsupportedPersonalClaim(claim)).toBe(true);
+  });
+
+  it.each(honestClaims)("keeps honest system claim %j green", (claim) => {
+    expect(isUnsupportedPersonalClaim(claim)).toBe(false);
+  });
+
+  it("treats personal states as invalid system phases but allows extra system phases", () => {
+    for (const phase of ["recorded", "dispatched", "context-committed", "queued", "thread-created"])
+      expect(isPersonalStatePhase(phase), phase).toBe(false);
+    for (const phase of ["seen", "read-receipt", "member_typing", "understood", "已读"])
+      expect(isPersonalStatePhase(phase), phase).toBe(true);
   });
 
   it("rejects a context-committed receipt that points to arbitrary non-empty x", async () => {
-    const result = await runGroupChatCheck(
-      "GC-09",
-      new SyntheticGroupChatHost({ contextCommitRef: "x" }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-09", { contextCommitRef: "x" })).passed).toBe(false);
   });
 
   it("fails if later-stage receipts are visible before their host operations", async () => {
-    const result = await runGroupChatCheck(
-      "GC-09",
-      new SyntheticGroupChatHost({ publishFutureReceiptsEarly: true }),
-    );
-    expect(result.passed).toBe(false);
+    expect((await check("GC-09", { publishFutureReceiptsEarly: true })).passed).toBe(false);
   });
 
   it("runs claim probes through the judge/readback path", async () => {
-    for (const claim of [
-      "👀",
-      "👀 已装入，不代表理解",
-      "我看见了",
-      "我看见了，不代表理解",
-      "seen; does not mean the member understood",
-      "typing",
-      "已读",
-      "不到一秒就已读",
-      "不一会儿我看见了",
-      "没多久就看到了",
-      "我不但看见了",
-      "不久前已读",
-    ]) {
-      const result = await runGroupChatCheck(
-        "GC-09",
-        new SyntheticGroupChatHost({ claimOverride: claim }),
-      );
-      expect(result.passed, claim).toBe(false);
+    for (const claim of unsupportedClaims) {
+      expect((await check("GC-09", { claimOverride: claim })).passed, claim).toBe(false);
     }
-    for (const claim of [
-      "系统已收，成员尚未派发",
-      "已装入，不代表理解",
-      "仍不等于理解或记忆",
-      "does not mean the member understood",
-      "成员尚未理解",
-      "成员未看见",
-      "成员不一定看到",
-      "成员未必看见",
-      "没有看见",
-      "尚未看到",
-      "已装入，不代表成员已读",
-      "ready; already; recorded",
-    ]) {
-      const result = await runGroupChatCheck(
-        "GC-09",
-        new SyntheticGroupChatHost({ claimOverride: claim }),
-      );
-      expect(result.passed, claim).toBe(true);
+    for (const claim of honestClaims) {
+      const result = await check("GC-09", { claimOverride: claim });
+      expect(result.passed, `${claim}: ${result.detail}`).toBe(true);
     }
+  });
+
+  it("fails if the orchestrator adds a reaction before the resident reacts", async () => {
+    const result = await check("GC-09", { proxyReaction: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("代发");
+  });
+
+  it("fails if committing context writes the resident's memory ledger", async () => {
+    const result = await check("GC-09", { commitWritesMemory: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("记忆");
+  });
+
+  it("allows an extra system phase but not a personal state dressed as one", async () => {
+    expect((await check("GC-09", { extraSystemPhase: "queued" })).passed).toBe(true);
+    expect((await check("GC-09", { extraSystemPhase: "seen" })).passed).toBe(false);
+  });
+
+  it("allows a resident-authored receipt only when that resident really reacted", async () => {
+    expect((await check("GC-09", { residentReceiptAfterReaction: true })).passed).toBe(true);
+    expect((await check("GC-09", { forgedResidentReceipt: true })).passed).toBe(false);
   });
 
   it("makes hidden-room body and side-channel surfaces invariant across hidden canaries", async () => {
-    const result = await runGroupChatCheck("GC-15", new SyntheticGroupChatHost());
-    expect(result.passed).toBe(true);
+    expect((await check("GC-15")).passed).toBe(true);
   });
 
   it("fails if a hidden canary leaks or the public event is replayed across rooms", async () => {
-    expect(
-      (
-        await runGroupChatCheck(
-          "GC-15",
-          new SyntheticGroupChatHost({ leakHiddenToUnauthorized: true }),
-        )
-      ).passed,
-    ).toBe(false);
-    expect(
-      (
-        await runGroupChatCheck(
-          "GC-15",
-          new SyntheticGroupChatHost({ acceptCrossRoomReplay: true }),
-        )
-      ).passed,
-    ).toBe(false);
+    expect((await check("GC-15", { leakHiddenToUnauthorized: true })).passed).toBe(false);
+    expect((await check("GC-15", { acceptCrossRoomReplay: true })).passed).toBe(false);
   });
 
   it("requires the hidden canary world and judge-seeded public readback to exist", async () => {
-    expect(
-      (await runGroupChatCheck("GC-15", new SyntheticGroupChatHost({ noHiddenRoom: true }))).passed,
-    ).toBe(false);
-    expect(
-      (await runGroupChatCheck("GC-15", new SyntheticGroupChatHost({ publicBodyX: true }))).passed,
-    ).toBe(false);
+    expect((await check("GC-15", { noHiddenRoom: true })).passed).toBe(false);
+    expect((await check("GC-15", { publicBodyX: true })).passed).toBe(false);
+  });
+
+  it("compares against a world without the hidden room, so existence cannot leak", async () => {
+    const result = await check("GC-15", { revealHiddenExistence: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("hidden-existence-difference");
+  });
+
+  it("stimulates a member reading another resident's scope and checks the viewer's context", async () => {
+    const leaked = await check("GC-15", { leakResidentScope: true });
+    expect(leaked.passed).toBe(false);
+    expect(leaked.detail).toContain("内部 scope");
+    expect((await check("GC-15", { silentScopeRead: true })).passed).toBe(false);
+  });
+
+  it("fails if a newcomer without a history grant sees pre-join public messages", async () => {
+    const result = await check("GC-15", { newResidentGetsHistory: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("入群前");
   });
 
   it("copies command arguments and host readbacks at the adapter boundary", async () => {
@@ -662,11 +873,11 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
   });
 
   it("counts declared STUBBED methods as yellow lamps, never true green or strict pass", () => {
-    const stubbedResults = groupChatChecks.map((check) => ({
-      id: check.id,
-      title: check.title,
+    const stubbedResults = groupChatChecks.map((item) => ({
+      id: item.id,
+      title: item.title,
       passed: true,
-      stubbed: check.uses.includes("perform"),
+      stubbed: item.uses.includes("perform"),
       detail: "synthetic positive-control readback",
     }));
     expect(scoreGroupChatResults(stubbedResults)).toEqual({
@@ -681,5 +892,56 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
       stubGreen: 0,
       strictPass: true,
     });
+  });
+});
+
+describe("#191 runner: real-host provenance and static source scan", () => {
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const alive = () => true;
+
+  it("rejects the synthetic host's self-report even though it is typed mist-host", async () => {
+    const run = await new SyntheticGroupChatHost().startHost();
+    expect(hostProvenanceProblem(run, { headCommit: head, isProcessAlive: () => false })).toMatch(
+      /not running/,
+    );
+    expect(hostProvenanceProblem(run, { headCommit: head, isProcessAlive: alive })).toMatch(
+      /not a commit id/,
+    );
+  });
+
+  it("requires a live process and the checked-out HEAD commit", () => {
+    const facts = { headCommit: head, isProcessAlive: alive };
+    expect(hostProvenanceProblem({ pid: process.pid, commit: head }, facts)).toBeNull();
+    expect(
+      hostProvenanceProblem({ pid: process.pid, commit: head.slice(0, 12) }, facts),
+    ).toBeNull();
+    expect(hostProvenanceProblem({ pid: process.pid, commit: "fedcba9876" }, facts)).toMatch(
+      /not the checked-out HEAD/,
+    );
+    expect(hostProvenanceProblem({ pid: process.pid, commit: "012345" }, facts)).toMatch(
+      /not a commit id/,
+    );
+    expect(hostProvenanceProblem({ pid: 0, commit: head }, facts)).toMatch(/valid process id/);
+  });
+
+  it("finds member-id literals only in non-test source files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "gc04-scan-"));
+    try {
+      await mkdir(join(root, "group-chat"), { recursive: true });
+      await mkdir(join(root, "tests"), { recursive: true });
+      await mkdir(join(root, "node_modules", "pkg"), { recursive: true });
+      const literal = `if (target === "${fixture.residentIds.b}") route();\n`;
+      await writeFile(join(root, "group-chat", "router.ts"), literal);
+      await writeFile(join(root, "group-chat", "router.test.ts"), literal);
+      await writeFile(join(root, "tests", "fixture.ts"), literal);
+      await writeFile(join(root, "node_modules", "pkg", "index.ts"), literal);
+      await writeFile(join(root, "group-chat", "roster.ts"), "export const members = load();\n");
+      expect(await findSourceLiterals(root, [fixture.residentIds.b])).toEqual([
+        join("group-chat", "router.ts"),
+      ]);
+      expect(await findSourceLiterals(join(root, "missing"), [fixture.residentIds.b])).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

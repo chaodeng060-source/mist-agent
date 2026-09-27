@@ -5,19 +5,27 @@
  *   npm run acceptance:group-chat:strict # nonzero unless all real-host checks pass
  *
  * A missing adapter is a known red baseline, never a green or host test result.
+ * `kind: "mist-host"` is only a type tag: before any lamp runs, the host's own report is
+ * checked against facts the judge reads itself (a live process, the current HEAD commit).
+ * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
  */
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFile, readdir } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { groupChatChecks, runGroupChatCheck } from "./group-chat-checks.ts";
 import {
   type GroupChatCheckId,
   type GroupChatHostDriver,
+  type GroupChatHostRun,
   cloneGroupChatDriverBoundary,
   groupChatSyntheticFixture,
 } from "./group-chat-driver.ts";
 
 const DRIVER_SPECIFIER = "../src/group-chat-acceptance-driver.ts";
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const SOURCE_ROOT = join(REPO_ROOT, "src");
 const strict = process.argv.includes("--strict");
 
 export interface GroupChatRunResult {
@@ -48,6 +56,74 @@ export function missingDriverResults(): GroupChatRunResult[] {
   }));
 }
 
+export interface HostProvenanceFacts {
+  readonly headCommit: string;
+  readonly isProcessAlive: (pid: number) => boolean;
+}
+
+/**
+ * Checks the host's self-reported run against judge-read facts. Returns the reason it is not
+ * acceptable as real-host evidence, or null. A synthetic fixture (made-up pid, placeholder
+ * commit) fails here even if it calls itself "mist-host".
+ */
+export function hostProvenanceProblem(
+  run: GroupChatHostRun,
+  facts: HostProvenanceFacts,
+): string | null {
+  if (!Number.isSafeInteger(run.pid) || run.pid <= 0)
+    return "host did not report a valid process id";
+  if (!facts.isProcessAlive(run.pid)) return `host process ${run.pid} is not running`;
+  const commit = run.commit.trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/u.test(commit)) return `host source "${run.commit}" is not a commit id`;
+  if (!facts.headCommit.trim().toLowerCase().startsWith(commit))
+    return `host source ${run.commit} is not the checked-out HEAD ${facts.headCommit.trim()}`;
+  return null;
+}
+
+function currentHeadCommit(): string {
+  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+const SOURCE_FILE = /\.[cm]?[jt]sx?$/u;
+const TEST_FILE = /\.(?:test|spec)\.[cm]?[jt]sx?$/u;
+const SKIPPED_DIRECTORIES = new Set(["node_modules", "__tests__", "test", "tests"]);
+
+/**
+ * GC-04 static half: non-test source files under `root` that spell out any of `terms`.
+ * Paths are reported relative to `displayRoot`. Only judge fixture/roster ids can be found
+ * this way; hard-coded production names are left to the two-world differential and review.
+ */
+export async function findSourceLiterals(
+  root: string,
+  terms: readonly string[],
+  displayRoot: string = root,
+): Promise<string[]> {
+  if (terms.length === 0 || !existsSync(root)) return [];
+  const hits: string[] = [];
+  const walk = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIPPED_DIRECTORIES.has(entry.name)) await walk(path);
+      } else if (entry.isFile() && SOURCE_FILE.test(entry.name) && !TEST_FILE.test(entry.name)) {
+        const text = await readFile(path, "utf8");
+        if (terms.some((term) => text.includes(term))) hits.push(relative(displayRoot, path));
+      }
+    }
+  };
+  await walk(root);
+  return hits.sort();
+}
+
 function driverFileExists(): boolean {
   return existsSync(fileURLToPath(new URL(DRIVER_SPECIFIER, import.meta.url)));
 }
@@ -67,9 +143,7 @@ async function loadDriver(): Promise<LoadedDriver | null> {
   }
   const driver = mod.createGroupChatHostDriver() as GroupChatHostDriver;
   if (driver.kind !== "mist-host") {
-    throw new Error(
-      "group-chat acceptance accepts only the real Mist host adapter; fake drivers are not host evidence",
-    );
+    throw new Error('group-chat adapter must be typed kind: "mist-host"');
   }
   return {
     driver: cloneGroupChatDriverBoundary(driver),
@@ -80,16 +154,24 @@ async function loadDriver(): Promise<LoadedDriver | null> {
 async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]> {
   const { driver, stubbed } = loaded;
   const host = await driver.startHost();
-  if (!Number.isSafeInteger(host.pid) || host.pid <= 0 || host.commit.trim() === "") {
+  const problem = hostProvenanceProblem(host, {
+    headCommit: currentHeadCommit(),
+    isProcessAlive: processIsAlive,
+  });
+  if (problem !== null) {
     await driver.stopHost();
-    throw new Error("real-host adapter did not report a valid process id and source commit");
+    throw new Error(`real-host provenance check failed: ${problem}`);
   }
 
+  const context = {
+    findSourceLiterals: (terms: readonly string[]) =>
+      findSourceLiterals(SOURCE_ROOT, terms, REPO_ROOT),
+  };
   const results: GroupChatRunResult[] = [];
   try {
     for (const check of groupChatChecks) {
       try {
-        const verdict = await runGroupChatCheck(check.id, driver);
+        const verdict = await runGroupChatCheck(check.id, driver, context);
         const isStubbed = check.uses.some((method) => stubbed.has(method));
         results.push({
           id: check.id,

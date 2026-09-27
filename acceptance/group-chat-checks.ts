@@ -1,11 +1,15 @@
 import {
+  type AccessAudit,
   GROUP_CHAT_CHECK_IDS,
   type GroupChatCheckId,
   type GroupChatCommand,
   type GroupChatEvidenceById,
   type GroupChatHostDriver,
+  type GroupChatRosterWorldEvidence,
   type ResidentId,
+  type RoomEvent,
   type RosterPath,
+  type SurfaceSnapshot,
   groupChatSyntheticFixture,
 } from "./group-chat-driver.ts";
 
@@ -14,6 +18,15 @@ export interface GroupChatCheck {
   readonly title: string;
   readonly scenario: readonly string[];
   readonly uses: readonly (keyof GroupChatHostDriver)[];
+}
+
+/**
+ * Judge-side facts that do not come from the host adapter. GC-04 needs the static half of
+ * "no member hard-wiring": the runner scans src/ and returns the non-test files that spell
+ * out one of the given member ids.
+ */
+export interface GroupChatJudgeContext {
+  readonly findSourceLiterals: (terms: readonly string[]) => Promise<readonly string[]>;
 }
 
 const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
@@ -39,27 +52,27 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
     id: "GC-03",
     title: "房间原账、成员投递账、个人记忆账相互隔离",
     scenario: [
-      "同一事件设 A=loaded、B=queued、C=not-targeted",
-      "读取三位住户私域后，由 A 显式保存并指回原事件",
-      "比较房间事件、成员状态、记忆写入和跨成员 canary",
+      "同一事件由判卷设 A=loaded、B=queued、C=not-targeted，只核三行投递账按成员分开读回",
+      "投递语义（谁真的装入或排队）留到投递账实现阶段，本灯不代它点绿",
+      "读取三位住户私域后，由 A 显式保存并指回原事件；比较原账、记忆写入和跨成员 canary",
     ],
   },
   {
     id: "GC-04",
     title: "新增成员通过所有成员表驱动路径",
     scenario: [
-      "从两位住户的成员表只新增第三位住户并递增版本",
+      "两个世界各从两位住户的成员表只新增一位不同的新住户，并递增版本",
       "依次走 broadcast、mention、projection、feedback、status",
-      "检查没有按成员写死的分支，且人类身份未伪装成住户",
+      "静态扫描 src/ 不得写死成员 id，且人类身份未伪装成住户",
     ],
   },
   {
     id: "GC-05",
     title: "只有结构化 mention 路由，且不绕回合闸",
     scenario: [
-      "在行首、句中、引用和名字前缀碰撞处写纯文本成员名/@名",
+      "在行首、句中、引用和名字前缀碰撞处分别写裸成员名与 @名",
       "再提交合法结构化目标住户 B、未知目标和越权目标",
-      "检查目标与实际路由一致，且 stop/turn gate 未被绕过",
+      "没有路由记录按零呼叫；检查目标与实际路由一致，且 stop/turn gate 未被绕过",
     ],
   },
   {
@@ -67,17 +80,17 @@ const groupChatCheckDefinitions: Omit<GroupChatCheck, "uses">[] = [
     title: "系统收据只报阶段，不冒充成员已读或理解",
     scenario: [
       "分别停在 recorded、dispatched、context-committed 阶段",
-      "核系统收据不得声称个人在场、已读、理解或记住",
-      "context-committed 收据须带提交引用；另由住户 A 主动 reaction 并保留本人作者",
+      "住户本人 reaction 前不得出现代发的 reaction；装入上下文不得写入记忆账",
+      "系统收据不得声称个人在场、已读、理解或记住；context-committed 须带提交引用",
     ],
   },
   {
     id: "GC-15",
     title: "隐藏房间对未授权方不泄露存在及跨域内容",
     scenario: [
-      "建立仅私域不同的合成公开/隐藏房间对照",
-      "由未授权住户尝试跨域读取和向错误房间重放公开载荷",
-      "新成员加入但不给历史授权，核正文/候选/计数/错误/回执",
+      "三个世界：隐藏房间内容不同的两个，加一个没有隐藏房间的，其余操作完全相同",
+      "未授权住户读隐藏房间、以成员资格读另一住户的 scope、向错误房间重放公开载荷",
+      "新成员不配置历史授权：看得到入群后的新消息，看不到入群前的公开史",
     ],
   },
 ];
@@ -113,6 +126,7 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "readSystemReceipts",
     "readContextCommits",
     "readReactions",
+    "readMemories",
   ],
   "GC-15": [
     "startHost",
@@ -120,6 +134,7 @@ const methodsByCheck: Record<GroupChatCheckId, readonly (keyof GroupChatHostDriv
     "perform",
     "readRoomEvents",
     "readSurface",
+    "readResidentContext",
     "readAccessAudit",
   ],
 };
@@ -145,59 +160,88 @@ function sameMembers(actual: readonly ResidentId[], expected: readonly ResidentI
   return expected.every((id) => actual.includes(id)) && actual.length === expected.length;
 }
 
-/** Claims that an acknowledgement proves personal presence/reading/understanding. */
+function sameMultiset(actual: readonly string[], expected: readonly string[]): boolean {
+  const key = (values: readonly string[]) => [...values].sort().join("\0");
+  return actual.length === expected.length && key(actual) === key(expected);
+}
+
+/** 子句边界：标点、换行，以及转折词——「不代表理解但已读」要拆开看。 */
+const CLAUSE_BOUNDARY = /[,，.。;；!！?？\n]|但是|可是|不过|然而|而是|但|\bbut\b/iu;
+
+/**
+ * 明确声称「个人状态已经发生」的说法。只认界面在场标记，以及带「已 / 了 / 正在」的肯定说法；
+ * 光秃秃的动词（理解、记忆、输入、看见）不算声称——诚实回执正是用它们写否定的，
+ * 例如设计图原句「装入也不证明住户理解、认同、回复或写入记忆」。
+ */
+const PERSONAL_STATE_CLAIMS: readonly RegExp[] = [
+  /👀|👁/gu,
+  /\b(?:seen|typing|typed|understood|understands|remembered|remembers|memori[sz]ed)\b/giu,
+  /\bread\b(?!-?(?:only|write))/giu,
+  /正在(?:输入|打字|阅读)/gu,
+  /(?:输入|打字)中(?=$|[\s…·.。,，;；!！?？:：)）」』"”'’~～-])/gu,
+  /已经?(?:读(?![取入写档])(?:过|完)?|阅(?:读)?|看(?:过|到|见)?)/gu,
+  /(?:看见|看到|看过)了/gu,
+  /已经?(?:理解|明白|懂|领会|记住|记下|记得)/gu,
+  /(?:理解|明白|懂|领会|记住|记下)了/gu,
+  /已经?(?:写入|存入|存进|记入|记进|写进|形成)(?:长期)?记忆/gu,
+  /(?:写入|存入|存进|记入|记进|写进|形成)了(?:长期)?记忆/gu,
+  /(?:写入|存入|存进|记入|记进|写进)(?:长期)?记忆了/gu,
+];
+
+/** 管到子句后部的否认：「不代表 / 不等于 / 不证明 X、Y 或 Z」。 */
+const DENIAL_SPAN =
+  /不代表|不等于|不证明|不表示|不说明|不意味着|不能说明|不能证明|不能代表|无法证明|并非|不是|不算|\b(?:does\s+not|doesn't|do\s+not|don't|did\s+not|didn't|is\s+not|isn't|are\s+not|aren't|was\s+not|wasn't|not)\s+(?:necessarily\s+)?(?:mean|prove|imply|indicate|show|equal)\b/iu;
+
+/** 紧贴在声称前的否定，可带一个「发 / 显示」类动词：「没有👀」「系统不发送👀」「尚未看到」。 */
+const IMMEDIATE_NEGATION =
+  /(?:没有|没|并未|尚未|未必|不一定|未|无|不|别|勿|禁止|不得|不会|不再|从不|绝不)(?:再)?(?:发送|发出|发|显示|展示|代发|标记|标注|添加|加上|加|带|给|出|亮|弹出|使用|用)?[\s"“'‘「『(（]*$/u;
+const ENGLISH_IMMEDIATE_NEGATION =
+  /\b(?:not|never|no|without|does\s+not|doesn't|did\s+not|didn't|do\s+not|don't|is\s+not|isn't|was\s+not|wasn't|were\s+not|weren't|has\s+not|hasn't|have\s+not|haven't|had\s+not|hadn't)\s+(?:yet\s+)?(?:been\s+|being\s+)?(?:(?:send|show|display|emit|add)(?:s|ing)?\s+)?(?:the\s+|an?\s+)?$/iu;
+
+/**
+ * Text guard for system receipts: flags only explicit personal-state assertions (presence
+ * marks such as 👀/typing/已读, or 已…/…了/正在… statements of reading, understanding and
+ * memory) that are not covered by a fixed denial. It does not try to parse whole sentences;
+ * GC-09's structural readbacks (proxied reactions, memory ledger, phases) carry the lamp.
+ */
 export function isUnsupportedPersonalClaim(claim: string): boolean {
-  if (claim.includes("👀")) return true;
-
-  const hasAffirmativeClaim = (pattern: RegExp): boolean =>
-    [...claim.matchAll(pattern)].some((match) => {
-      const index = match.index ?? 0;
-      const previousText = claim.slice(0, index);
-      const clauseStart = Math.max(
-        previousText.lastIndexOf(","),
-        previousText.lastIndexOf(";"),
-        previousText.lastIndexOf("."),
-        previousText.lastIndexOf("!"),
-        previousText.lastIndexOf("?"),
-        previousText.lastIndexOf("，"),
-        previousText.lastIndexOf("；"),
-        previousText.lastIndexOf("。"),
-        previousText.lastIndexOf("！"),
-        previousText.lastIndexOf("？"),
-        previousText.lastIndexOf("\n"),
-      );
-      const prefix = previousText.slice(clauseStart + 1);
-      const directlyDeniedInEnglish =
-        /\b(?:does\s+not|doesn't|did\s+not|didn't|do\s+not|don't|not|never|is\s+not|isn't|was\s+not|wasn't|were\s+not|weren't|has\s+not|hasn't|have\s+not|haven't|had\s+not|hadn't)\s+(?:necessarily\s+)?(?:(?:mean|show|prove|indicate)\s+(?:that\s+)?)?(?:(?:the\s+)?(?:member\s+)?)?(?:has\s+|have\s+|been\s+|the\s+)?$/iu.test(
-          prefix,
+  return claim.split(CLAUSE_BOUNDARY).some((clause) =>
+    PERSONAL_STATE_CLAIMS.some((pattern) =>
+      [...clause.matchAll(pattern)].some((match) => {
+        const prefix = clause.slice(0, match.index ?? 0);
+        return !(
+          DENIAL_SPAN.test(prefix) ||
+          IMMEDIATE_NEGATION.test(prefix) ||
+          ENGLISH_IMMEDIATE_NEGATION.test(prefix)
         );
-      const chinesePrefix = prefix.trimEnd();
-      const directlyDeniedInChinese = /(?:没有|没|并未|尚未|未必|不一定|未|不)$/u.test(
-        chinesePrefix,
-      );
-      const shortSubjectDenialInChinese =
-        /(?:并不代表|不代表|并不等于|不等于|并不表示|不表示|并不说明|不说明|并不证明|不证明)(?:当前成员|这个成员|该成员|成员|本人|对方|这个人|我|你|他|她)?$/u.test(
-          chinesePrefix,
-        );
-      const coordinatedDenialInChinese =
-        /(?:并不代表|不代表|并不等于|不等于|并不表示|不表示|并不说明|不说明|并不证明|不证明)(?:当前成员|这个成员|该成员|成员|本人|对方|这个人|我|你|他|她)?(?:看见|看到|已读|阅读|输入|打字|理解|记住|记忆)(?:或者|以及|或|和|与|及|、)$/u.test(
-          chinesePrefix,
-        );
-      return (
-        !directlyDeniedInEnglish &&
-        !directlyDeniedInChinese &&
-        !shortSubjectDenialInChinese &&
-        !coordinatedDenialInChinese
-      );
-    });
+      }),
+    ),
+  );
+}
 
-  const presenceClaim =
-    /\b(?:seen|read|typing|typed)\b|(?:看见了?|看到了?|已读|阅读|正在输入|输入|正在打字|打字中)/giu;
-  if (hasAffirmativeClaim(presenceClaim)) return true;
+const PERSONAL_PHASE_WORDS = new Set([
+  "seen",
+  "read",
+  "typing",
+  "typed",
+  "viewed",
+  "understood",
+  "remembered",
+  "memorized",
+  "memorised",
+  "presence",
+]);
+const PERSONAL_PHASE_CJK = /已读|已阅|看见|看到|在场|正在输入|理解|记住|记忆/u;
 
-  const understandingClaim =
-    /\b(?:understood|understands|remembered|remembers)\b|(?:理解|记住|记忆)/giu;
-  return hasAffirmativeClaim(understandingClaim);
+/** Phases are machine names: extra system phases (e.g. queued) pass, personal states do not. */
+export function isPersonalStatePhase(phase: string): boolean {
+  return (
+    PERSONAL_PHASE_CJK.test(phase) ||
+    phase
+      .toLowerCase()
+      .split(/[^a-z0-9]+/u)
+      .some((word) => PERSONAL_PHASE_WORDS.has(word))
+  );
 }
 
 export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
@@ -227,11 +271,8 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         groupChatSyntheticFixture.residentIds.a,
         groupChatSyntheticFixture.residentIds.a,
       ];
-      if (
-        e.recordedAuthorIds.length !== expectedAuthors.length ||
-        expectedAuthors.some((author) => !e.recordedAuthorIds.includes(author))
-      )
-        return fail("原账作者与两条认证正向消息不完全一致");
+      if (!sameMultiset(e.recordedAuthorIds, expectedAuthors))
+        return fail("原账作者与三条认证消息（人类、住户 A、正文伪造样本）不完全一致");
       return { passed: true, detail: "绑定身份入账；伪造 envelope 拒绝；原账作者未被正文改写" };
     }
     case "GC-02": {
@@ -260,7 +301,7 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         e.deliveryByResident[groupChatSyntheticFixture.residentIds.b] !== "queued" ||
         e.deliveryByResident[groupChatSyntheticFixture.residentIds.c] !== "not-targeted"
       )
-        return fail("三位成员投递状态不符合夹具");
+        return fail("三位成员的投递账读回与判卷设置不符");
       if (
         e.memoryWritesByResident[groupChatSyntheticFixture.residentIds.a] !== 1 ||
         e.memoryWritesByResident[groupChatSyntheticFixture.residentIds.b] !== 0 ||
@@ -278,41 +319,50 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
         !e.roomEventIdsBeforeSave.includes(e.judgeSeededEventId)
       )
         return fail("A 的显式保存未指回原房间事件");
-      return { passed: true, detail: "原账不变；成员投递各自准确；仅 A 显式保存且引用原事件" };
+      return {
+        passed: true,
+        detail:
+          "原账不变；三行投递账按成员分开读回（投递语义留待投递账阶段）；仅 A 显式保存且引用原事件",
+      };
     }
     case "GC-04": {
       const e = evidence as GroupChatEvidenceById["GC-04"];
-      const paths = Object.values(e.residentIdsByPath);
       const existingResidents: readonly ResidentId[] = [
         groupChatSyntheticFixture.residentIds.a,
         groupChatSyntheticFixture.residentIds.b,
       ];
-      if (existingResidents.includes(e.expectedNewResidentId))
-        return fail("所谓新增成员其实已在原成员表中");
-      if (!sameMembers(e.rosterResidentIdsBefore, existingResidents))
-        return fail("新增前 readRoster 成员名单与夹具不一致");
-      if (!sameMembers(e.rosterResidentIdsAfter, [...existingResidents, e.expectedNewResidentId]))
-        return fail("新增后 readRoster 未读回完整成员名单");
-      if (e.rosterVersionAfter <= e.rosterVersionBefore)
-        return fail("新增成员前后成员表版本没有递增");
-      if (
-        paths.some(
-          (ids) =>
-            !sameMembers(ids, [
-              groupChatSyntheticFixture.residentIds.a,
-              groupChatSyntheticFixture.residentIds.b,
-              e.expectedNewResidentId,
-            ]),
+      if (e.worlds.length < 2) return fail("成员表差分少于两个世界");
+      if (new Set(e.worlds.map((world) => world.newResidentId)).size !== e.worlds.length)
+        return fail("差分世界用了同一位新成员");
+      for (const world of e.worlds) {
+        const newcomer = world.newResidentId;
+        if (existingResidents.includes(newcomer))
+          return fail(`所谓新增成员 ${newcomer} 其实已在原成员表中`);
+        if (!sameMembers(world.rosterResidentIdsBefore, existingResidents))
+          return fail(`新增 ${newcomer} 前 readRoster 成员名单与夹具不一致`);
+        if (!sameMembers(world.rosterResidentIdsAfter, [...existingResidents, newcomer]))
+          return fail(`新增 ${newcomer} 后 readRoster 未读回完整成员名单`);
+        if (world.rosterVersionAfter <= world.rosterVersionBefore)
+          return fail(`新增 ${newcomer} 前后成员表版本没有递增`);
+        if (
+          Object.values(world.residentIdsByPath).some(
+            (ids) => !sameMembers(ids, [...existingResidents, newcomer]),
+          )
         )
-      )
-        return fail("新增成员未贯通所有成员表路径");
-      if (e.hardCodedResidentBranchFound || e.humanRenderedAsResident)
-        return fail("发现成员硬接线或人类身份伪装");
-      return { passed: true, detail: "新增成员贯通五条路径；无成员硬接线；人类身份独立" };
+          return fail(`新成员 ${newcomer} 未贯通所有成员表路径`);
+        if (world.humanRenderedAsResident) return fail("人类身份被当成住户");
+      }
+      if (e.sourceFilesWithRosterIdLiterals.length > 0)
+        return fail(`src/ 写死了成员 id：${e.sourceFilesWithRosterIdLiterals.join("、")}`);
+      return {
+        passed: true,
+        detail: "两个世界换不同新成员都贯通五条路径；src/ 无成员 id 字面量；人类身份独立",
+      };
     }
     case "GC-05": {
       const e = evidence as GroupChatEvidenceById["GC-05"];
       if (e.callsFromTextOnlyMentions !== 0) return fail("正文里的名字触发了调用");
+      if (e.targetsResolvedFromText !== 0) return fail("正文里的名字被解析成了呼叫目标");
       if (
         e.routedResidentId !== e.structuredTargetId ||
         e.routedResidentId !== groupChatSyntheticFixture.residentIds.b
@@ -321,46 +371,56 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (!e.legitimateStructuredRouteAccepted)
         return fail("闸门开放时合法结构化目标没有恰好路由一次");
       if (!e.unknownTargetRejected || !e.unauthorizedTargetRejected)
-        return fail("未知或越权目标未拒绝");
+        return fail("未知或越权目标被接受或产生了调用");
       if (e.turnOrStopGateBypassed) return fail("mention 绕过回合/停止闸");
       return {
         passed: true,
-        detail: "仅结构化目标路由正确；纯文本不触发；拒绝非法目标且保留控制闸",
+        detail: "仅结构化目标路由正确；@名与裸名都不触发；非法目标零调用；控制闸未被绕过",
       };
     }
     case "GC-09": {
       const e = evidence as GroupChatEvidenceById["GC-09"];
+      const systemReceipts = e.receipts.filter((receipt) => receipt.actor === "system");
+      if (systemReceipts.some((receipt) => isUnsupportedPersonalClaim(receipt.claim ?? "")))
+        return fail("系统收据冒充个人在场、已读、理解或记忆");
+      if (systemReceipts.some((receipt) => isPersonalStatePhase(receipt.phase)))
+        return fail("系统收据把个人状态当成了阶段");
+      if (e.reactionAuthorsBeforeResidentReacted.length > 0)
+        return fail("住户还没 reaction，编排层已代发了 reaction");
+      if (e.memoryRecordsAddedByContextCommit > 0) return fail("上下文装入被当成写入记忆");
+      if (e.prematureReceiptPhases.length > 0) return fail("系统阶段收据在对应阶段前已提前出现");
+      const requiredPhases = ["recorded", "dispatched", "context-committed"];
+      if (
+        requiredPhases.some((phase) => !systemReceipts.some((receipt) => receipt.phase === phase))
+      )
+        return fail("系统收据没有覆盖 recorded、dispatched、context-committed 三个阶段");
+      if (
+        e.judgeSeededContextCommitId === null ||
+        systemReceipts.some(
+          (receipt) =>
+            receipt.phase === "context-committed" &&
+            receipt.contextCommitRef !== e.judgeSeededContextCommitId,
+        )
+      )
+        return fail("context-committed 收据缺少提交引用");
+      if (
+        !sameMultiset(e.reactionAuthorsAfterResidentReacted, [
+          groupChatSyntheticFixture.residentIds.a,
+        ])
+      )
+        return fail("成员主动 reaction 未保留真实作者");
       if (
         e.receipts.some(
           (receipt) =>
-            receipt.actor === "system" && isUnsupportedPersonalClaim(receipt.claim ?? ""),
+            receipt.actor !== "system" &&
+            !e.reactionAuthorsAfterResidentReacted.includes(receipt.actor),
         )
       )
-        return fail("系统收据冒充个人在场、已读、理解或记忆");
-      if (e.systemClaimedPersonalPresence || e.systemClaimedUnderstandingOrMemory)
-        return fail("系统状态把派发/提交夸大为个人状态");
-      if (e.prematureReceiptPhases.length > 0) return fail("系统阶段收据在对应阶段前已提前出现");
-      if (e.receipts.length === 0 || e.receipts.some((receipt) => receipt.actor !== "system"))
-        return fail("系统阶段收据缺失或伪造了个人作者");
-      if (
-        e.receipts.some(
-          (receipt) => !["recorded", "dispatched", "context-committed"].includes(receipt.phase),
-        )
-      )
-        return fail("系统收据出现了未定义的阶段");
-      const requiredPhases = ["recorded", "dispatched", "context-committed"];
-      if (requiredPhases.some((phase) => !e.receipts.some((receipt) => receipt.phase === phase)))
-        return fail("系统收据没有覆盖 recorded、dispatched、context-committed 三个阶段");
-      const contextCommits = e.receipts.filter((receipt) => receipt.phase === "context-committed");
-      if (
-        contextCommits.length === 0 ||
-        e.judgeSeededContextCommitId === null ||
-        contextCommits.some((receipt) => receipt.contextCommitRef !== e.judgeSeededContextCommitId)
-      )
-        return fail("context-committed 收据缺少提交引用");
-      if (e.residentReactionAuthorId !== groupChatSyntheticFixture.residentIds.a)
-        return fail("成员主动 reaction 未保留真实作者");
-      return { passed: true, detail: "收据署名系统且阶段有限；成员 reaction 保留真实作者" };
+        return fail("收据里出现了没有本人 reaction 对应的个人作者");
+      return {
+        passed: true,
+        detail: "收据署名系统且阶段准确；未代发 reaction；装入不写记忆；本人 reaction 保留作者",
+      };
     }
     case "GC-15": {
       const e = evidence as GroupChatEvidenceById["GC-15"];
@@ -372,11 +432,26 @@ export function evaluateGroupChatEvidence<K extends GroupChatCheckId>(
       if (!e.hiddenWorldSeedsPresent)
         return fail("公开/隐藏对照世界未实际建立或隐藏 canary 未读回");
       if (e.unauthorizedSurfaceLeaks.length > 0)
-        return fail(`未授权表面泄漏 ${e.unauthorizedSurfaceLeaks.length} 项`);
+        return fail(
+          `未授权表面泄漏 ${e.unauthorizedSurfaceLeaks.length} 项：${e.unauthorizedSurfaceLeaks.join("、")}`,
+        );
+      if (!e.scopeReadSeedPresent)
+        return fail("住户 A 读不回自己私域的 canary，跨住户读取负例无效");
+      if (e.crossResidentScopeLeaks.length > 0)
+        return fail(
+          `以房间成员资格读到了另一住户的内部 scope：${e.crossResidentScopeLeaks.join("、")}`,
+        );
+      if (!e.scopeReadDenied) return fail("跨住户 scope 读取没有留下恰好一次拒绝");
       if (e.crossResidentPrivateReads !== 0) return fail("发生跨住户私域读取");
-      if (e.newResidentReceivedHistoryByDefault) return fail("新成员默认获得历史权限");
+      if (!e.newResidentSawPostJoinMessage) return fail("新成员入群后看不到新消息，历史负例无效");
+      if (e.newResidentReceivedHistoryByDefault)
+        return fail("新成员未配置历史授权却看到了入群前的公开消息");
       if (e.crossRoomReplayAccepted) return fail("公开载荷被写入错误房间");
-      return { passed: true, detail: "授权公开可见；未授权面零泄漏；无跨成员读取或默认全史" };
+      return {
+        passed: true,
+        detail:
+          "三世界差分无隐藏域痕迹；跨住户 scope 读取被拒且零泄漏；新成员无默认历史；公开载荷不跨房",
+      };
     }
   }
 }
@@ -385,22 +460,21 @@ function hasMarker(events: readonly { readonly body: string }[], marker: string)
   return events.some(({ body }) => body.includes(marker));
 }
 
-function matchingEvent(
-  events: readonly import("./group-chat-driver.ts").RoomEvent[],
-  marker: string,
-): import("./group-chat-driver.ts").RoomEvent | null {
+function matchingEvent(events: readonly RoomEvent[], marker: string): RoomEvent | null {
   const matches = events.filter(({ body }) => body.includes(marker));
   return matches.length === 1 ? (matches[0] ?? null) : null;
 }
 
-function surfaceText(surface: {
-  readonly body: string;
-  readonly candidates: readonly string[];
-  readonly count: number;
-  readonly errorCode: string | null;
-  readonly receipt: string | null;
-}): string {
+function surfaceText(surface: SurfaceSnapshot): string {
   return JSON.stringify(surface);
+}
+
+/** Readbacks may be live host objects; copy them before later operations mutate them. */
+function snapshotAudit(audit: AccessAudit): AccessAudit {
+  return {
+    crossResidentPrivateReads: audit.crossResidentPrivateReads,
+    unauthorizedReadResults: [...audit.unauthorizedReadResults],
+  };
 }
 
 /**
@@ -410,6 +484,7 @@ function surfaceText(surface: {
 export async function runGroupChatCheck(
   id: GroupChatCheckId,
   driver: GroupChatHostDriver,
+  context?: GroupChatJudgeContext,
 ): Promise<GroupChatCheckResult> {
   const fixture = groupChatSyntheticFixture;
   await driver.resetScenario(id, fixture);
@@ -559,6 +634,8 @@ export async function runGroupChatCheck(
         binding: "test-binding:owner",
         body: marker,
       });
+      // PR1 sets the three delivery states itself: this lamp checks that the host keeps one
+      // ledger row per member and reads them back apart, not how delivery decides a state.
       for (const [residentId, state] of [
         [fixture.residentIds.a, "loaded"],
         [fixture.residentIds.b, "queued"],
@@ -607,7 +684,7 @@ export async function runGroupChatCheck(
       };
       const visibleText = surfaces.map(surfaceText).join("\n");
       const privateCanariesVisibleToOtherResidents = privateCanaries.flatMap(
-        ([ownerId, canary], ownerIndex) =>
+        ([, canary], ownerIndex) =>
           contexts.some(
             (context, contextIndex) => contextIndex !== ownerIndex && context.includes(canary),
           )
@@ -631,10 +708,8 @@ export async function runGroupChatCheck(
       });
     }
     case "GC-04": {
-      const before = await driver.readRoster();
-      const newResidentId = fixture.residentIds.newcomer;
-      await act({ kind: "register-resident", residentId: newResidentId });
-      const after = await driver.readRoster();
+      if (context === undefined)
+        throw new Error("GC-04 needs the judge-side src/ literal scan (findSourceLiterals)");
       const paths: readonly RosterPath[] = [
         "broadcast",
         "mention",
@@ -642,35 +717,46 @@ export async function runGroupChatCheck(
         "feedback",
         "status",
       ];
-      for (const path of paths)
-        await act({ kind: "exercise-roster-path", path, residentId: newResidentId });
-      const projections = await Promise.all(paths.map((path) => driver.readRosterPath(path)));
-      const residentIdsByPath = {
-        broadcast: projections[0]?.residentIds ?? [],
-        mention: projections[1]?.residentIds ?? [],
-        projection: projections[2]?.residentIds ?? [],
-        feedback: projections[3]?.residentIds ?? [],
-        status: projections[4]?.residentIds ?? [],
-      };
-      const humanRenderedAsResident = projections.some(
-        (projection) =>
-          projection?.residentIds.some((residentId) => String(residentId) === fixture.humanId) ??
-          false,
-      );
+      const worlds: GroupChatRosterWorldEvidence[] = [];
+      const rosterIds = new Set<string>();
+      for (const newResidentId of [fixture.residentIds.newcomer, fixture.residentIds.newcomerAlt]) {
+        await driver.resetScenario(id, fixture);
+        const before = await driver.readRoster();
+        await act({ kind: "register-resident", residentId: newResidentId });
+        const after = await driver.readRoster();
+        for (const path of paths)
+          await act({ kind: "exercise-roster-path", path, residentId: newResidentId });
+        const projections = await Promise.all(paths.map((path) => driver.readRosterPath(path)));
+        for (const residentId of [...before.residentIds, ...after.residentIds])
+          rosterIds.add(residentId);
+        worlds.push({
+          newResidentId,
+          rosterVersionBefore: before.version,
+          rosterVersionAfter: after.version,
+          rosterResidentIdsBefore: before.residentIds,
+          rosterResidentIdsAfter: after.residentIds,
+          residentIdsByPath: {
+            broadcast: projections[0]?.residentIds ?? [],
+            mention: projections[1]?.residentIds ?? [],
+            projection: projections[2]?.residentIds ?? [],
+            feedback: projections[3]?.residentIds ?? [],
+            status: projections[4]?.residentIds ?? [],
+          },
+          humanRenderedAsResident: projections.some((projection) =>
+            projection.residentIds.some((residentId) => String(residentId) === fixture.humanId),
+          ),
+        });
+      }
+      const memberIds = [
+        ...new Set([...rosterIds, ...Object.values(fixture.residentIds), fixture.humanId]),
+      ];
       return evaluateGroupChatEvidence(id, {
-        rosterVersionBefore: before.version,
-        rosterVersionAfter: after.version,
-        rosterResidentIdsBefore: before.residentIds,
-        rosterResidentIdsAfter: after.residentIds,
-        expectedNewResidentId: newResidentId,
-        residentIdsByPath,
-        hardCodedResidentBranchFound: projections.some(
-          (projection) => !projection?.residentIds.includes(newResidentId),
-        ),
-        humanRenderedAsResident,
+        worlds,
+        sourceFilesWithRosterIdLiterals: await context.findSourceLiterals(memberIds),
       });
     }
     case "GC-05": {
+      const target = fixture.residentIds.b;
       const markers = {
         valid: "TEST-GC05-STRUCTURED",
         unknown: "TEST-GC05-UNKNOWN",
@@ -678,24 +764,26 @@ export async function runGroupChatCheck(
         gatedStop: "TEST-GC05-GATED-STOP",
         gatedTurn: "TEST-GC05-GATED-TURN",
       };
+      // Each body starts with its marker; the name sits at a line start, mid-sentence, in a
+      // quote, or collides by prefix — once as @name and once as the bare member id.
       const plainVariants = [
-        ["TEST-GC05-PLAIN-START", `@${fixture.residentIds.b} at line start`],
-        ["TEST-GC05-PLAIN-SENTENCE", `text @${fixture.residentIds.b} in sentence`],
-        ["TEST-GC05-PLAIN-QUOTE", `quote: @${fixture.residentIds.b}`],
-        ["TEST-GC05-PLAIN-PREFIX", `@${fixture.residentIds.b}-suffix`],
+        ["TEST-GC05-AT-LINE-START", `\n@${target} please take a look`],
+        ["TEST-GC05-AT-SENTENCE", ` ask @${target} before deciding`],
+        ["TEST-GC05-AT-QUOTE", `\n> @${target} said this earlier`],
+        ["TEST-GC05-AT-PREFIX", ` @${target}-suffix is someone else`],
+        ["TEST-GC05-NAME-LINE-START", `\n${target} please take a look`],
+        ["TEST-GC05-NAME-SENTENCE", ` ask ${target} before deciding`],
+        ["TEST-GC05-NAME-QUOTE", `\n> ${target} said this earlier`],
+        ["TEST-GC05-NAME-PREFIX", ` ${target}b is someone else`],
       ] as const;
       for (const [marker, text] of plainVariants) {
-        await act({
-          kind: "plain-text-mention",
-          roomId: fixture.roomId,
-          body: `${marker} ${text}`,
-        });
+        await act({ kind: "plain-text-mention", roomId: fixture.roomId, body: `${marker}${text}` });
       }
       await act({ kind: "set-turn-gate", stopped: false, turnOpen: true });
       await act({
         kind: "structured-mention",
         roomId: fixture.roomId,
-        targetId: fixture.residentIds.b,
+        targetId: target,
         body: markers.valid,
       });
       await act({
@@ -714,45 +802,50 @@ export async function runGroupChatCheck(
       await act({
         kind: "structured-mention",
         roomId: fixture.roomId,
-        targetId: fixture.residentIds.b,
+        targetId: target,
         body: markers.gatedStop,
       });
       await act({ kind: "set-turn-gate", stopped: false, turnOpen: false });
       await act({
         kind: "structured-mention",
         roomId: fixture.roomId,
-        targetId: fixture.residentIds.b,
+        targetId: target,
         body: markers.gatedTurn,
       });
       const routes = await driver.readRoutes();
-      const find = (marker: string) => routes.find((route) => route.marker === marker);
-      const plainRoutes = plainVariants.map(([marker]) => find(marker));
-      const valid = find(markers.valid);
-      const unknown = find(markers.unknown);
-      const unauthorized = find(markers.unauthorized);
-      const gated = [find(markers.gatedStop), find(markers.gatedTurn)];
-      return evaluateGroupChatEvidence(id, {
-        callsFromTextOnlyMentions: plainRoutes.some((route) => route === undefined)
-          ? Number.MAX_SAFE_INTEGER
-          : plainRoutes.reduce((sum, route) => sum + (route?.calls ?? 0), 0),
-        structuredTargetId: fixture.residentIds.b,
-        routedResidentId: (valid?.targetId ?? null) as ResidentId | null,
-        legitimateStructuredRouteAccepted:
-          routes.filter((route) => route.marker === markers.valid).length === 1 &&
-          valid?.calls === 1 &&
-          valid.rejected === false &&
-          valid.targetId === fixture.residentIds.b,
-        unknownTargetRejected: unknown?.rejected === true && unknown.calls === 0,
-        unauthorizedTargetRejected: unauthorized?.rejected === true && unauthorized.calls === 0,
-        turnOrStopGateBypassed: gated.some(
+      const rowsFor = (marker: string) => routes.filter((route) => route.marker === marker);
+      // A host that makes no call may keep no route row at all: absence counts as zero calls.
+      const plainRows = plainVariants.flatMap(([marker]) => rowsFor(marker));
+      const refused = (marker: string) =>
+        rowsFor(marker).every(
           (route) =>
-            route === undefined || !route.rejected || route.calls !== 0 || route.gateBypassed,
-        ),
+            route.calls === 0 && !route.gateBypassed && (route.rejected || route.targetId === null),
+        );
+      // A closed gate may reject or hold the mention, but must not call or bypass.
+      const held = (marker: string) =>
+        rowsFor(marker).every((route) => route.calls === 0 && !route.gateBypassed);
+      const valid = rowsFor(markers.valid);
+      const validRoute = valid[0];
+      return evaluateGroupChatEvidence(id, {
+        callsFromTextOnlyMentions: plainRows.reduce((sum, route) => sum + route.calls, 0),
+        targetsResolvedFromText: plainRows.filter((route) => route.targetId !== null).length,
+        structuredTargetId: target,
+        routedResidentId: (validRoute?.targetId ?? null) as ResidentId | null,
+        legitimateStructuredRouteAccepted:
+          valid.length === 1 &&
+          validRoute?.calls === 1 &&
+          validRoute.rejected === false &&
+          validRoute.targetId === target,
+        unknownTargetRejected: refused(markers.unknown),
+        unauthorizedTargetRejected: refused(markers.unauthorized),
+        turnOrStopGateBypassed: !held(markers.gatedStop) || !held(markers.gatedTurn),
       });
     }
     case "GC-09": {
       const eventMarker = "TEST-GC09-RECEIPT-EVENT";
       const commitMarker = "TEST-GC09-CONTEXT-COMMIT";
+      const resident = fixture.residentIds.a;
+      const memoriesAtStart = (await driver.readMemories()).length;
       await act({
         kind: "record-event",
         roomId: fixture.roomId,
@@ -766,147 +859,210 @@ export async function runGroupChatCheck(
       const receiptsAfterDispatch = (await driver.readSystemReceipts()).map((receipt) => ({
         ...receipt,
       }));
-      await act({
-        kind: "commit-context",
-        residentId: fixture.residentIds.a,
-        marker: commitMarker,
-      });
+      await act({ kind: "commit-context", residentId: resident, marker: commitMarker });
+      const memoriesAfterCommit = (await driver.readMemories()).length;
       const commit = (await driver.readContextCommits()).filter(
         (item) => item.marker === commitMarker,
       );
       const expectedCommitId = commit.length === 1 ? (commit[0]?.id ?? null) : null;
-      await act({ kind: "react", residentId: fixture.residentIds.a, eventMarker });
+      const reactionsBefore = (await driver.readReactions())
+        .filter((reaction) => reaction.eventMarker === eventMarker)
+        .map((reaction) => reaction.residentId);
+      await act({ kind: "react", residentId: resident, eventMarker });
       const receipts = await driver.readSystemReceipts();
-      const reactions = await driver.readReactions();
+      const reactionsAfter = (await driver.readReactions())
+        .filter((reaction) => reaction.eventMarker === eventMarker)
+        .map((reaction) => reaction.residentId);
+      const laterPhase = (phase: string) => phase === "dispatched" || phase === "context-committed";
       const prematureReceiptPhases = [
         ...receiptsAfterRecord
-          .filter((receipt) => receipt.phase !== "recorded")
+          .filter((receipt) => receipt.actor === "system" && laterPhase(receipt.phase))
           .map((receipt) => `before-dispatch:${receipt.phase}`),
         ...receiptsAfterDispatch
-          .filter((receipt) => receipt.phase === "context-committed")
+          .filter((receipt) => receipt.actor === "system" && receipt.phase === "context-committed")
           .map((receipt) => `before-context-commit:${receipt.phase}`),
       ];
       return evaluateGroupChatEvidence(id, {
-        receipts: receipts.map((receipt) => ({
-          ...receipt,
-          actor: receipt.actor,
-        })),
-        systemClaimedPersonalPresence: receipts.some(
-          (receipt) =>
-            receipt.actor === "system" && isUnsupportedPersonalClaim(receipt.claim ?? ""),
-        ),
-        systemClaimedUnderstandingOrMemory: receipts.some(
-          (receipt) =>
-            receipt.actor === "system" &&
-            /(?:understood|remembered|理解|记住|记忆)/iu.test(receipt.claim ?? "") &&
-            isUnsupportedPersonalClaim(receipt.claim ?? ""),
-        ),
+        receipts,
         prematureReceiptPhases,
         judgeSeededContextCommitId: expectedCommitId,
-        residentReactionAuthorId:
-          reactions.find((reaction) => reaction.eventMarker === eventMarker)?.residentId ?? null,
+        reactionAuthorsBeforeResidentReacted: reactionsBefore,
+        reactionAuthorsAfterResidentReacted: reactionsAfter,
+        memoryRecordsAddedByContextCommit: memoriesAfterCommit - memoriesAtStart,
       });
     }
     case "GC-15": {
-      const runWorld = async (hiddenCanary: string) => {
-        await driver.resetScenario(id, fixture);
-        await act({
-          kind: "create-room",
-          roomId: fixture.roomId,
-          visibility: "public",
-          body: "TEST-GC15-PUBLIC",
-        });
-        await act({
-          kind: "create-room",
-          roomId: fixture.hiddenRoomId,
-          visibility: "hidden",
-          body: hiddenCanary,
-        });
-        const replayMarker = "TEST-GC15-CROSS-ROOM-REPLAY";
-        await act({
+      const { a, b, c } = fixture.residentIds;
+      const markers = {
+        publicSeed: "TEST-GC15-PUBLIC",
+        history: "TEST-GC15-PRE-JOIN-HISTORY",
+        replay: "TEST-GC15-CROSS-ROOM-REPLAY",
+        afterJoin: "TEST-GC15-POST-JOIN",
+      };
+      const scopeCanary = fixture.canaries.privateA;
+      const humanPost = (body: string) =>
+        act({
           kind: "post",
           roomId: fixture.roomId,
           principalId: fixture.humanId,
           visibility: "public",
           binding: "test-binding:owner",
-          body: replayMarker,
+          body,
         });
+      const runWorld = async (hiddenCanary: string | null) => {
+        await driver.resetScenario(id, fixture);
+        await act({
+          kind: "create-room",
+          roomId: fixture.roomId,
+          visibility: "public",
+          body: markers.publicSeed,
+        });
+        if (hiddenCanary !== null) {
+          await act({
+            kind: "create-room",
+            roomId: fixture.hiddenRoomId,
+            visibility: "hidden",
+            body: hiddenCanary,
+          });
+        }
+        await act({ kind: "seed-resident-private", residentId: a, canary: scopeCanary });
+        await humanPost(markers.history);
+        await humanPost(markers.replay);
         await act({
           kind: "replay-public-payload",
           sourceRoomId: fixture.roomId,
           targetRoomId: fixture.hiddenRoomId,
-          eventMarker: replayMarker,
+          eventMarker: markers.replay,
         });
         await act({ kind: "attempt-room-read", roomId: fixture.roomId, viewerId: fixture.humanId });
+        await act({ kind: "attempt-room-read", roomId: fixture.hiddenRoomId, viewerId: b });
+        const auditBeforeScopeRead = snapshotAudit(await driver.readAccessAudit());
         await act({
-          kind: "attempt-room-read",
-          roomId: fixture.hiddenRoomId,
-          viewerId: fixture.residentIds.b,
+          kind: "attempt-resident-scope-read",
+          roomId: fixture.roomId,
+          viewerId: b,
+          ownerId: a,
         });
-        await act({ kind: "register-resident", residentId: fixture.residentIds.c });
-        await act({
-          kind: "attempt-room-read",
-          roomId: fixture.hiddenRoomId,
-          viewerId: fixture.residentIds.c,
-        });
+        const auditAfterScopeRead = snapshotAudit(await driver.readAccessAudit());
+        await act({ kind: "register-resident", residentId: c });
+        await act({ kind: "attempt-room-read", roomId: fixture.hiddenRoomId, viewerId: c });
+        await humanPost(markers.afterJoin);
         const hiddenEvents = await driver.readRoomEvents(fixture.hiddenRoomId);
         return {
-          publicSurface: await driver.readSurface(fixture.roomId, fixture.humanId),
           hiddenEvents,
-          hiddenSeedPresent: hiddenEvents.some(
-            (event) =>
-              event.roomId === fixture.hiddenRoomId &&
-              event.visibility === "hidden" &&
-              event.body.includes(hiddenCanary),
-          ),
-          unauthorizedB: await driver.readSurface(fixture.hiddenRoomId, fixture.residentIds.b),
-          newResident: await driver.readSurface(fixture.hiddenRoomId, fixture.residentIds.c),
-          audit: await driver.readAccessAudit(),
+          hiddenSeedPresent:
+            hiddenCanary !== null &&
+            hiddenEvents.some(
+              (event) =>
+                event.roomId === fixture.hiddenRoomId &&
+                event.visibility === "hidden" &&
+                event.body.includes(hiddenCanary),
+            ),
+          publicSurface: await driver.readSurface(fixture.roomId, fixture.humanId),
+          unauthorizedHidden: await driver.readSurface(fixture.hiddenRoomId, b),
+          viewerPublic: await driver.readSurface(fixture.roomId, b),
+          viewerContext: await driver.readResidentContext(b),
+          ownerContext: await driver.readResidentContext(a),
+          newResidentHidden: await driver.readSurface(fixture.hiddenRoomId, c),
+          newResidentPublic: await driver.readSurface(fixture.roomId, c),
+          auditBeforeScopeRead,
+          auditAfterScopeRead,
+          audit: snapshotAudit(await driver.readAccessAudit()),
         };
       };
-      const first = await runWorld("TEST-PRIVATE-CANARY:hidden-a");
-      const second = await runWorld("TEST-PRIVATE-CANARY:hidden-b");
-      const unauthorizedText = [
-        surfaceText(first.unauthorizedB),
-        surfaceText(second.unauthorizedB),
-        surfaceText(first.newResident),
-        surfaceText(second.newResident),
-        ...first.audit.unauthorizedReadResults,
-        ...second.audit.unauthorizedReadResults,
-      ].join("\n");
-      const canaries = ["TEST-PRIVATE-CANARY:hidden-a", "TEST-PRIVATE-CANARY:hidden-b"];
-      const leaks = canaries.filter((canary) => unauthorizedText.includes(canary));
-      if (surfaceText(first.unauthorizedB) !== surfaceText(second.unauthorizedB))
-        leaks.push("hidden-surface-difference:b");
-      if (surfaceText(first.newResident) !== surfaceText(second.newResident))
-        leaks.push("hidden-surface-difference:new-resident");
-      if (surfaceText(first.publicSurface) !== surfaceText(second.publicSurface))
-        leaks.push("hidden-surface-difference:public-view");
-      if (JSON.stringify(first.audit) !== JSON.stringify(second.audit))
-        leaks.push("hidden-audit-difference");
-      if (
-        first.audit.unauthorizedReadResults.length !== 2 ||
-        second.audit.unauthorizedReadResults.length !== 2 ||
-        [...first.audit.unauthorizedReadResults, ...second.audit.unauthorizedReadResults].some(
-          (result) => result !== "not-found",
-        )
-      ) {
-        leaks.push("unauthorized-read-attempts-missing-or-not-denied");
+      const hiddenCanaries = ["TEST-PRIVATE-CANARY:hidden-a", "TEST-PRIVATE-CANARY:hidden-b"];
+      const withA = await runWorld("TEST-PRIVATE-CANARY:hidden-a");
+      const withB = await runWorld("TEST-PRIVATE-CANARY:hidden-b");
+      const withoutHidden = await runWorld(null);
+      const worlds = [withA, withB, withoutHidden];
+
+      const leaks: string[] = [];
+      const unauthorizedText = [withA, withB]
+        .flatMap((world) => [
+          surfaceText(world.unauthorizedHidden),
+          surfaceText(world.viewerPublic),
+          surfaceText(world.newResidentHidden),
+          surfaceText(world.newResidentPublic),
+          world.viewerContext,
+          ...world.audit.unauthorizedReadResults,
+        ])
+        .join("\n");
+      leaks.push(...hiddenCanaries.filter((canary) => unauthorizedText.includes(canary)));
+      // Content worlds differ only in the hidden canary, so no surface may differ between them.
+      for (const surface of [
+        "unauthorizedHidden",
+        "viewerPublic",
+        "newResidentHidden",
+        "newResidentPublic",
+        "publicSurface",
+      ] as const) {
+        if (surfaceText(withA[surface]) !== surfaceText(withB[surface]))
+          leaks.push(`hidden-content-difference:${surface}`);
       }
-      const auditReadCount =
-        first.audit.crossResidentPrivateReads + second.audit.crossResidentPrivateReads;
-      const newResidentReceivedHistoryByDefault = canaries.some((canary) =>
-        `${surfaceText(first.newResident)} ${surfaceText(second.newResident)}`.includes(canary),
+      // The third world has no hidden room at all: a difference seen by a viewer without
+      // hidden-room access reveals that the room exists. The owner may legitimately know.
+      for (const surface of [
+        "unauthorizedHidden",
+        "viewerPublic",
+        "newResidentHidden",
+        "newResidentPublic",
+      ] as const) {
+        if (surfaceText(withA[surface]) !== surfaceText(withoutHidden[surface]))
+          leaks.push(`hidden-existence-difference:${surface}`);
+      }
+      if (JSON.stringify(withA.audit) !== JSON.stringify(withB.audit))
+        leaks.push("hidden-audit-difference");
+      for (const world of [withA, withB]) {
+        const hiddenReadByResident = world.auditBeforeScopeRead.unauthorizedReadResults;
+        const hiddenReadByNewcomer = world.audit.unauthorizedReadResults.slice(
+          world.auditAfterScopeRead.unauthorizedReadResults.length,
+        );
+        if (
+          hiddenReadByResident.length !== 1 ||
+          hiddenReadByResident[0] !== "not-found" ||
+          hiddenReadByNewcomer.length !== 1 ||
+          hiddenReadByNewcomer[0] !== "not-found"
+        ) {
+          leaks.push("unauthorized-read-attempts-missing-or-not-denied");
+        }
+      }
+
+      const scopeReadDenied = worlds.every((world) => {
+        const added = world.auditAfterScopeRead.unauthorizedReadResults.slice(
+          world.auditBeforeScopeRead.unauthorizedReadResults.length,
+        );
+        return added.length === 1 && (added[0] === "not-found" || added[0] === "forbidden");
+      });
+      const crossResidentScopeLeaks = worlds.flatMap((world, index) =>
+        [
+          { where: "context", text: world.viewerContext },
+          { where: "public-surface", text: surfaceText(world.viewerPublic) },
+          { where: "hidden-surface", text: surfaceText(world.unauthorizedHidden) },
+        ].flatMap(({ where, text }) =>
+          text.includes(scopeCanary) ? [`world-${index + 1}:${where}`] : [],
+        ),
       );
+      const newResidentPublicText = worlds.map((world) => surfaceText(world.newResidentPublic));
       return evaluateGroupChatEvidence(id, {
-        authorizedPublicSurface: first.publicSurface.body,
-        hiddenWorldSeedsPresent: first.hiddenSeedPresent && second.hiddenSeedPresent,
+        authorizedPublicSurface: withA.publicSurface.body,
+        hiddenWorldSeedsPresent: withA.hiddenSeedPresent && withB.hiddenSeedPresent,
         unauthorizedSurfaceLeaks: leaks,
-        crossResidentPrivateReads: auditReadCount,
-        newResidentReceivedHistoryByDefault,
-        crossRoomReplayAccepted:
-          hasMarker(first.hiddenEvents, "TEST-GC15-CROSS-ROOM-REPLAY") ||
-          hasMarker(second.hiddenEvents, "TEST-GC15-CROSS-ROOM-REPLAY"),
+        crossResidentPrivateReads: worlds.reduce(
+          (sum, world) => sum + world.audit.crossResidentPrivateReads,
+          0,
+        ),
+        scopeReadSeedPresent: worlds.every((world) => world.ownerContext.includes(scopeCanary)),
+        crossResidentScopeLeaks,
+        scopeReadDenied,
+        newResidentSawPostJoinMessage: newResidentPublicText.every((text) =>
+          text.includes(markers.afterJoin),
+        ),
+        newResidentReceivedHistoryByDefault: newResidentPublicText.some(
+          (text) => text.includes(markers.history) || text.includes(markers.replay),
+        ),
+        crossRoomReplayAccepted: worlds.some((world) =>
+          hasMarker(world.hiddenEvents, markers.replay),
+        ),
       });
     }
   }

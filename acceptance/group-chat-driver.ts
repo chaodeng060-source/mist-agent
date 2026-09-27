@@ -18,7 +18,8 @@ export type ResidentId =
   | "test-resident:a"
   | "test-resident:b"
   | "test-resident:c"
-  | "test-resident:novel-d";
+  | "test-resident:novel-d"
+  | "test-resident:novel-e";
 export type DeliveryState = "loaded" | "queued" | "not-targeted";
 export type RosterPath = "broadcast" | "mention" | "projection" | "feedback" | "status";
 
@@ -31,6 +32,8 @@ export const groupChatSyntheticFixture = Object.freeze({
     b: "test-resident:b",
     c: "test-resident:c",
     newcomer: "test-resident:novel-d",
+    /** GC-04 second world: a different newcomer, so a branch keyed on one id cannot pass. */
+    newcomerAlt: "test-resident:novel-e",
   }),
   canaries: Object.freeze({
     privateA: "TEST-PRIVATE-CANARY:a",
@@ -109,6 +112,13 @@ export type GroupChatCommand =
       readonly eventMarker: string;
     }
   | { readonly kind: "attempt-room-read"; readonly roomId: string; readonly viewerId: string }
+  | {
+      /** A room member tries to read another resident's internal scope through the room. */
+      readonly kind: "attempt-resident-scope-read";
+      readonly roomId: string;
+      readonly viewerId: ResidentId;
+      readonly ownerId: ResidentId;
+    }
   | { readonly kind: "set-resident"; readonly residentId: ResidentId };
 
 export interface RoomEvent {
@@ -169,6 +179,17 @@ export interface ResidentReaction {
   readonly eventMarker: string;
 }
 
+/** One GC-04 world: add a single newcomer, then read every roster-driven path back. */
+export interface GroupChatRosterWorldEvidence {
+  readonly newResidentId: ResidentId;
+  readonly rosterVersionBefore: number;
+  readonly rosterVersionAfter: number;
+  readonly rosterResidentIdsBefore: readonly ResidentId[];
+  readonly rosterResidentIdsAfter: readonly ResidentId[];
+  readonly residentIdsByPath: Readonly<Record<RosterPath, readonly ResidentId[]>>;
+  readonly humanRenderedAsResident: boolean;
+}
+
 /** Judge-derived observations assembled from the readback APIs below. */
 export interface GroupChatEvidenceById {
   "GC-01": {
@@ -201,17 +222,13 @@ export interface GroupChatEvidenceById {
     savedSourceEventId: string | null;
   };
   "GC-04": {
-    rosterVersionBefore: number;
-    rosterVersionAfter: number;
-    rosterResidentIdsBefore: readonly ResidentId[];
-    rosterResidentIdsAfter: readonly ResidentId[];
-    expectedNewResidentId: ResidentId;
-    residentIdsByPath: Readonly<Record<RosterPath, readonly ResidentId[]>>;
-    hardCodedResidentBranchFound: boolean;
-    humanRenderedAsResident: boolean;
+    worlds: readonly GroupChatRosterWorldEvidence[];
+    /** Repo-relative non-test files under src/ that spell out a roster/fixture member id. */
+    sourceFilesWithRosterIdLiterals: readonly string[];
   };
   "GC-05": {
     callsFromTextOnlyMentions: number;
+    targetsResolvedFromText: number;
     structuredTargetId: ResidentId;
     routedResidentId: ResidentId | null;
     legitimateStructuredRouteAccepted: boolean;
@@ -220,23 +237,23 @@ export interface GroupChatEvidenceById {
     turnOrStopGateBypassed: boolean;
   };
   "GC-09": {
-    receipts: readonly {
-      actor: "system" | ResidentId;
-      phase: string;
-      claim?: string;
-      contextCommitRef?: string;
-    }[];
-    systemClaimedPersonalPresence: boolean;
-    systemClaimedUnderstandingOrMemory: boolean;
+    receipts: readonly SystemReceipt[];
     prematureReceiptPhases: readonly string[];
     judgeSeededContextCommitId: string | null;
-    residentReactionAuthorId: string | null;
+    /** Reactions on the judge event read back before the resident's own react command. */
+    reactionAuthorsBeforeResidentReacted: readonly string[];
+    reactionAuthorsAfterResidentReacted: readonly string[];
+    memoryRecordsAddedByContextCommit: number;
   };
   "GC-15": {
     authorizedPublicSurface: string;
     hiddenWorldSeedsPresent: boolean;
     unauthorizedSurfaceLeaks: readonly string[];
     crossResidentPrivateReads: number;
+    scopeReadSeedPresent: boolean;
+    crossResidentScopeLeaks: readonly string[];
+    scopeReadDenied: boolean;
+    newResidentSawPostJoinMessage: boolean;
     newResidentReceivedHistoryByDefault: boolean;
     crossRoomReplayAccepted: boolean;
   };

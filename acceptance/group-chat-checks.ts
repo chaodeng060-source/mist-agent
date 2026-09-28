@@ -189,20 +189,26 @@ const PERSONAL_STATE_CLAIMS: readonly {
 }[] = [
   { kind: "presence", pattern: /👀|👁/gu },
   { kind: "presence", pattern: /\b(?:typing|typed)\b/giu },
-  { kind: "presence", pattern: /正在(?:输入|打字|阅读)|在打字/gu },
+  // 在场标记只留 👀、typing、正在输入、在打字。正在阅读 / 正在看见是阅读类，否认跨度能放行。
+  { kind: "presence", pattern: /正在(?:输入|打字)|在打字/gu },
   { kind: "presence", pattern: /(?:输入|打字)中(?=$|[\s…·.。,，;；!！?？:：)）」』"”'’~～-])/gu },
   { kind: "reading", pattern: /\b(?:seen|saw|viewed)\b/giu },
   { kind: "reading", pattern: /\bread\b(?!-?(?:only|write))/giu },
   { kind: "reading", pattern: /已经?(?:读(?![取入写档])(?:过|完)?|阅(?:读)?|看(?:过|到|见)?)/gu },
   { kind: "reading", pattern: /(?:看见|看到)(?:(?![不没未非])[^\s,，.。;；:：!！?？、]){0,6}了/gu },
-  { kind: "reading", pattern: /(?:看|浏览|阅读)过(?![程去来])|(?<![解判])读过/gu },
+  { kind: "reading", pattern: /(?:看(?:见|到)?|浏览|阅读)过(?![程去来])|(?<![解判])读过/gu },
   { kind: "reading", pattern: /(?<![解判宣])(?:阅读|读)了/gu },
+  { kind: "reading", pattern: /正在(?:阅读|看见)/gu },
   { kind: "understanding", pattern: /\b(?:understood|understands)\b/giu },
   { kind: "understanding", pattern: /已经?(?:理解|明白|懂|领会)/gu },
   { kind: "understanding", pattern: /(?:理解|明白|懂|领会)了/gu },
+  { kind: "understanding", pattern: /(?:理解|明白|懂|领会)过(?![程去来])/gu },
+  { kind: "understanding", pattern: /正在理解/gu },
   { kind: "memory", pattern: /\b(?:remembered|remembers|memori[sz]ed)\b/giu },
   { kind: "memory", pattern: /已经?(?:记住|记下)|记得/gu },
   { kind: "memory", pattern: /(?:记住|记下)了/gu },
+  { kind: "memory", pattern: /(?:记住|记下)过(?![程去来])/gu },
+  { kind: "memory", pattern: /正在记住/gu },
   { kind: "memory", pattern: /已经?(?:写入|存入|存进|记入|记进|写进|形成)(?:长期)?记忆/gu },
   { kind: "memory", pattern: /(?:写入|存入|存进|记入|记进|写进|形成)了(?:长期)?记忆/gu },
   { kind: "memory", pattern: /(?:写入|存入|存进|记入|记进|写进)(?:长期)?记忆/gu },
@@ -238,10 +244,30 @@ const SYSTEM_SUBJECT = /系统|\bsystem\b/iu;
 const PERSONAL_SUBJECT =
   /成员|住户|对方|用户|本人|我|你|他|她|代|替|\b(?:member|resident|user|he|she|they|you|i)\b/iu;
 const SYSTEM_OBJECT = /^(?:配置|设置|参数|日志|文件|索引|缓存|队列|数据库|请求|清单)/u;
+/** 角色词。人称另判，避免「代码」里的「代」、「其他」里的「他」被当成成员。 */
+const MEMBER_ROLE = /成员|住户|\b(?:member|resident|user|he|she|they|you|i)\b/iu;
+/** 「其他」里的「他」不算人称。 */
+const MEMBER_PRONOUN = /(?<!其)[她他]|[我你]|(?<!使)用户|对方|本人/u;
+/** 去掉「系统」后，整段是两到四字或一段拉丁名，才算具体成员名。 */
+const CONCRETE_MEMBER_NAME = /^[\p{Script=Han}]{2,4}$|^[A-Za-z][A-Za-z0-9_-]{1,32}$/u;
+const NOT_A_MEMBER_NAME = /^(?:刚刚|刚才|自动|直接|代码|其他|当前|现在|本地|成功|代表)$/u;
 
-/** 系统自己读配置、看到投递失败，不是替成员声称已读：「系统已看到投递失败」「已读完配置」。 */
+/** 主语是成员、住户、人称，或一个具体名字。 */
+function isMemberSubject(prefix: string): boolean {
+  if (MEMBER_ROLE.test(prefix) || MEMBER_PRONOUN.test(prefix)) return true;
+  const subject = prefix
+    .replaceAll("系统", "")
+    .replace(/\bsystem\b/giu, "")
+    .trim();
+  if (subject.length === 0 || NOT_A_MEMBER_NAME.test(subject) || SYSTEM_OBJECT.test(subject))
+    return false;
+  return CONCRETE_MEMBER_NAME.test(subject);
+}
+
+/** 系统自己读配置、看到投递失败，不是替成员声称已读：「系统已看到投递失败」「已读完配置」。主语是成员时不放行。 */
 function isSystemReading(prefix: string, text: string, suffix: string): boolean {
   if (READ_RECEIPT_MARK.test(text)) return false;
+  if (isMemberSubject(prefix)) return false;
   if (SYSTEM_SUBJECT.test(prefix) && !PERSONAL_SUBJECT.test(prefix)) return true;
   return /[读阅]/u.test(text) && SYSTEM_OBJECT.test(suffix.trimStart());
 }

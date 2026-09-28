@@ -775,9 +775,11 @@ export async function runGroupChatCheck(
         visibility: "public" as const,
       };
       await act({ ...base, roomId: fixture.roomId, body: markers.valid });
+      // Every negative comes from the same sender and drops exactly one boundary, so a red
+      // lamp names the missing boundary rather than a change of sender.
       await act({
         kind: "post",
-        principalId: fixture.humanId,
+        principalId: senderId,
         binding: base.binding,
         roomId: fixture.roomId,
         body: markers.visibility,

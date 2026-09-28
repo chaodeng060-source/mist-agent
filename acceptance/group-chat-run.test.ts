@@ -42,6 +42,7 @@ import {
   hostProvenanceProblem,
   hostStopProblem,
   isRepoEntryFile,
+  provenanceFailedResults,
   readProcessInfo,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
@@ -52,6 +53,8 @@ interface TestOptions {
   readonly dropForgedBodyPost?: boolean;
   readonly trustBodyAuthorHeader?: boolean;
   readonly acceptInvalidPosts?: boolean;
+  /** Checks boundaries on the human entry only: accept a resident post with just this defect. */
+  readonly acceptOnlyInvalid?: "visibility" | "room" | "binding" | "private-fields";
   readonly wrongMemorySource?: boolean;
   readonly noopSeedPrivate?: boolean;
   readonly leakPrivateCanariesIntoRoom?: boolean;
@@ -203,7 +206,24 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
           command.binding === "test-binding:owner" &&
           command.privateFields === undefined &&
           command.claimedAuthorId === undefined;
-        if (!valid && !this.options.acceptInvalidPosts && !this.options.acceptForged) return;
+        const defects = [
+          command.visibility !== "public" ? "visibility" : null,
+          command.roomId === "" ? "room" : null,
+          command.binding !== "test-binding:owner" ? "binding" : null,
+          command.privateFields !== undefined ? "private-fields" : null,
+          command.claimedAuthorId !== undefined ? "claimed-author" : null,
+        ].filter((defect) => defect !== null);
+        const toleratedDefect =
+          command.principalId !== fixture.humanId &&
+          defects.length === 1 &&
+          defects[0] === this.options.acceptOnlyInvalid;
+        if (
+          !valid &&
+          !toleratedDefect &&
+          !this.options.acceptInvalidPosts &&
+          !this.options.acceptForged
+        )
+          return;
         const bodyAuthor = this.options.trustBodyAuthorHeader
           ? command.body.match(/^From:\s*([^\r\n]+)/mu)?.[1]
           : undefined;
@@ -729,6 +749,11 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ["GC-01", { dropForgedBodyPost: true }, "正文身份伪造负例"],
     ["GC-01", { trustBodyAuthorHeader: true }, "正文身份伪造负例"],
     ["GC-02", { acceptInvalidPosts: true }, "缺显式边界"],
+    // Each boundary on its own: the resident sender dropping only visibility must go red too.
+    ["GC-02", { acceptOnlyInvalid: "visibility" }, "缺显式边界"],
+    ["GC-02", { acceptOnlyInvalid: "room" }, "缺显式边界"],
+    ["GC-02", { acceptOnlyInvalid: "binding" }, "缺显式边界"],
+    ["GC-02", { acceptOnlyInvalid: "private-fields" }, "缺显式边界"],
     ["GC-02", { noopSeedPrivate: true }, "发送方私有"],
     ["GC-02", { leakPrivateCanariesIntoRoom: true }, "泄漏"],
     ["GC-03", { wrongMemorySource: true }, "指回原房间事件"],
@@ -1053,6 +1078,26 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ).toBe(true);
   });
 
+  it("reports a provenance failure as seven red lamps naming the reason, never a baseline", () => {
+    const reason = "real-host provenance check failed: host process 7 is not running";
+    const results = provenanceFailedResults(reason);
+    expect(results.map(({ id }) => id)).toEqual(GROUP_CHAT_CHECK_IDS);
+    expect(
+      results.every(
+        ({ passed, stubbed, detail }) =>
+          !passed &&
+          !stubbed &&
+          detail.includes(reason) &&
+          !detail.includes("real-host driver missing"),
+      ),
+    ).toBe(true);
+    expect(scoreGroupChatResults(results)).toEqual({
+      trueGreen: 0,
+      stubGreen: 0,
+      strictPass: false,
+    });
+  });
+
   it("counts declared STUBBED methods as yellow lamps, never true green or strict pass", () => {
     const stubbedResults = groupChatChecks.map((item) => ({
       id: item.id,
@@ -1171,6 +1216,46 @@ describe("#191 runner: real-host provenance and static source scan", () => {
     expect(isRepoEntryFile("../outside/src/host.ts", repoRoot)).toBe(false);
   });
 
+  it("finds an entry path containing spaces in a space-joined `ps` command line", async () => {
+    const root = await mkdtemp(join(tmpdir(), "gc-provenance-"));
+    try {
+      await mkdir(join(root, "src", "host dir"), { recursive: true });
+      await writeFile(join(root, "src", "host dir", "main.ts"), "export {};\n");
+      const words = [node, "--import", "tsx", join(root, "src", "host"), "dir/main.ts"];
+      const withRoot = (info: HostProcessInfo): HostProvenanceFacts => ({
+        ...facts(info),
+        repoRoot: root,
+      });
+      const run = { pid: 5000, commit: head };
+      expect(
+        hostProvenanceProblem(run, withRoot(hostProcess({ args: words, argvSplitOnSpaces: true }))),
+      ).toBeNull();
+      // Exact argv is taken as given: the same words as separate arguments name no entry.
+      expect(hostProvenanceProblem(run, withRoot(hostProcess({ args: words })))).toMatch(
+        /no entry file/,
+      );
+      expect(
+        hostProvenanceProblem(
+          run,
+          withRoot(
+            hostProcess({
+              args: [node, join(root, "src", "host"), "dir/other.ts"],
+              argvSplitOnSpaces: true,
+            }),
+          ),
+        ),
+      ).toMatch(/no entry file/);
+      expect(
+        hostProvenanceProblem(
+          run,
+          withRoot(hostProcess({ executable: null, args: words, argvSplitOnSpaces: true })),
+        ),
+      ).toMatch(/unreadable binary/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("requires the host process gone and readbacks refused after stopHost()", async () => {
     const refusing = {
       readRoomEvents: async (): Promise<readonly RoomEvent[]> => {
@@ -1187,9 +1272,11 @@ describe("#191 runner: real-host provenance and static source scan", () => {
   it.skipIf(process.platform === "win32")(
     "reads a real child's liveness, parents, binary and argv, and forgets it after exit",
     async () => {
-      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-        stdio: "ignore",
-      });
+      const child = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)", "arg with  spaces"],
+        { stdio: "ignore" },
+      );
       const pid = child.pid ?? -1;
       try {
         const vias = process.platform === "linux" ? (["proc", "ps"] as const) : (["ps"] as const);
@@ -1199,8 +1286,18 @@ describe("#191 runner: real-host provenance and static source scan", () => {
           expect(info?.ancestors, via).toContain(process.pid);
           expect(info?.args?.[1], via).toBe("-e");
         }
-        if (process.platform === "linux")
-          expect(readProcessInfo(pid, "proc")?.executable).toBe(realpathSync(process.execPath));
+        // `ps` only has the space-joined line; its words rejoin to the original argument.
+        const viaPs = readProcessInfo(pid, "ps");
+        expect(viaPs?.argvSplitOnSpaces).toBe(true);
+        expect(viaPs?.args?.join(" ")).toMatch(/ arg with {2}spaces$/u);
+        if (process.platform === "linux") {
+          const viaProc = readProcessInfo(pid, "proc");
+          expect(viaProc?.executable).toBe(realpathSync(process.execPath));
+          expect(viaProc?.args?.at(-1)).toBe("arg with  spaces");
+          expect(viaProc?.argvSplitOnSpaces).toBeUndefined();
+          // procps reports comm as a bare name: unreadable, never matched by name.
+          expect(viaPs?.executable).toBeNull();
+        }
       } finally {
         const exited = new Promise((done) => child.once("exit", done));
         child.kill();

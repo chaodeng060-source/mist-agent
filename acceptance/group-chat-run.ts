@@ -11,12 +11,14 @@
  * commit is the checked-out HEAD. After stopHost() the process must be gone and readbacks must
  * reject. These checks stop lazy stand-ins; a judge-written durable challenge proving that
  * readbacks come from the host's own ledger waits for the #191 adapter's data-root contract.
+ * A host that fails these checks gets seven red lamps naming the reason and a nonzero exit in
+ * both modes: it is a broken adapter, not the missing-driver baseline.
  * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { groupChatChecks, runGroupChatCheck } from "./group-chat-checks.ts";
 import {
@@ -60,6 +62,26 @@ export function missingDriverResults(): GroupChatRunResult[] {
   }));
 }
 
+/** The adapter's host failed the judge's own process/source checks, before or after the lamps. */
+export class HostProvenanceError extends Error {
+  override readonly name = "HostProvenanceError";
+}
+
+/**
+ * A host that fails provenance leaves no lamp judged: readbacks cannot be attributed to it.
+ * All seven report red with the reason; this is a broken adapter, not the missing-driver
+ * baseline, so the runner exits nonzero in report mode too.
+ */
+export function provenanceFailedResults(reason: string): GroupChatRunResult[] {
+  return groupChatChecks.map(({ id, title }) => ({
+    id,
+    title,
+    passed: false,
+    stubbed: false,
+    detail: `${reason} (no lamp judged: readbacks are not attributable to the reported host)`,
+  }));
+}
+
 /** What the judge reads about a process itself: Linux /proc, other POSIX systems `ps`. */
 export interface HostProcessInfo {
   /** Present and not a zombie. */
@@ -70,6 +92,26 @@ export interface HostProcessInfo {
   readonly executable: string | null;
   /** argv including argv[0], or null if unreadable. */
   readonly args: readonly string[] | null;
+  /**
+   * True when only a space-joined command line was readable (`ps`), so `args` are its words
+   * and an argument that contains spaces arrives split across several of them.
+   */
+  readonly argvSplitOnSpaces?: boolean;
+}
+
+/**
+ * Arguments after argv[0] that may name the host entry file. From a space-joined command line
+ * every run of consecutive words is a candidate, so an entry path containing spaces still
+ * matches; isRepoEntryFile() then accepts only an existing non-test file under src/.
+ */
+function entryArgCandidates(info: HostProcessInfo): string[] {
+  const args = info.args?.slice(1) ?? [];
+  if (info.argvSplitOnSpaces !== true) return [...args];
+  const spans: string[] = [];
+  for (let start = 0; start < args.length; start++)
+    for (let end = start + 1; end <= args.length; end++)
+      spans.push(args.slice(start, end).join(" "));
+  return spans;
 }
 
 export interface HostProvenanceFacts {
@@ -99,7 +141,7 @@ export function hostProvenanceProblem(
     return `host process ${run.pid} was not started by this judge run (not a descendant of pid ${facts.judgePid})`;
   if (info.executable !== facts.judgeExecutable)
     return `host process ${run.pid} runs ${info.executable ?? "an unreadable binary"}, not this judge's node ${facts.judgeExecutable}`;
-  if (info.args === null || !info.args.slice(1).some((arg) => isRepoEntryFile(arg, facts.repoRoot)))
+  if (!entryArgCandidates(info).some((arg) => isRepoEntryFile(arg, facts.repoRoot)))
     return `host process ${run.pid} command line names no entry file under src/ in this checkout`;
   const commit = run.commit.trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/u.test(commit)) return `host source "${run.commit}" is not a commit id`;
@@ -184,12 +226,20 @@ export function readProcessInfo(
   }
   const state = psField(pid, "stat");
   if (state === null || state === "") return null;
+  // macOS `ps` reports comm as the executable's path. Where it is only a short name (procps,
+  // BSDs) the binary counts as unreadable: provenance then fails closed with that reason
+  // instead of matching a bare name, or a same-named file in the judge's working directory.
   const command = psField(pid, "comm");
   return {
     alive: !state.startsWith("Z"),
     ancestors: ancestorsOf(pid, (child) => Number(psField(child, "ppid") ?? 0)),
-    executable: command === null ? null : (attempt(() => realpathSync(command)) ?? command),
-    args: psField(pid, "args")?.split(/\s+/u) ?? null,
+    executable:
+      command === null || !isAbsolute(command)
+        ? null
+        : (attempt(() => realpathSync(command)) ?? command),
+    // `ps` joins argv with single spaces; keep empty words so a span rejoins to the original.
+    args: psField(pid, "args")?.split(" ") ?? null,
+    argvSplitOnSpaces: true,
   };
 }
 
@@ -276,7 +326,7 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
   const problem = hostProvenanceProblem(host, facts);
   if (problem !== null) {
     await driver.stopHost();
-    throw new Error(`real-host provenance check failed: ${problem}`);
+    throw new HostProvenanceError(`real-host provenance check failed: ${problem}`);
   }
 
   const context = {
@@ -310,7 +360,9 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
   }
   const stopProblem = await hostStopProblem(driver, host.pid, facts.readProcess);
   if (stopProblem !== null)
-    throw new Error(`real-host provenance check failed after stopHost(): ${stopProblem}`);
+    throw new HostProvenanceError(
+      `real-host provenance check failed after stopHost(): ${stopProblem}`,
+    );
   console.log(`真实宿主进程 PID ${host.pid}；代码 ${host.commit}`);
   console.log(
     "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
@@ -324,7 +376,19 @@ async function main(): Promise<void> {
   console.log(`合成夹具：${groupChatSyntheticFixture.roomId}；不读取真实聊天/记忆/凭据`);
   console.log("");
 
-  const results = driver === null ? missingDriverResults() : await runHostChecks(driver);
+  let provenanceFailed = false;
+  let results: GroupChatRunResult[];
+  if (driver === null) {
+    results = missingDriverResults();
+  } else {
+    try {
+      results = await runHostChecks(driver);
+    } catch (error) {
+      if (!(error instanceof HostProvenanceError)) throw error;
+      provenanceFailed = true;
+      results = provenanceFailedResults(error.message);
+    }
+  }
   const score = scoreGroupChatResults(results);
   for (const result of results) {
     console.log(
@@ -337,6 +401,10 @@ async function main(): Promise<void> {
     `真实宿主通过 ${driver === null ? 0 : score.trueGreen} / ${results.length}${score.stubGreen > 0 ? `；桩灯 ${score.stubGreen}` : ""}`,
   );
   if (driver === null) console.log("这轮只确认 PR1 的预期红灯；没有执行宿主正向/负向验收。");
+  if (provenanceFailed) {
+    console.log("宿主来源核对未通过：这是坏 adapter，不是缺驱动的起点，报告模式同样非零退出。");
+    process.exitCode = 1;
+  }
   if (strict && !score.strictPass) process.exitCode = 1;
 }
 

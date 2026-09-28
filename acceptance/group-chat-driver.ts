@@ -44,6 +44,11 @@ export const groupChatSyntheticFixture = Object.freeze({
   }),
 });
 
+/**
+ * What startHost() reports about the host it launched. The runner checks it against facts it
+ * reads itself: the pid must be a live descendant of the judge process running this judge's
+ * node binary with an entry file from this checkout, and commit must be the checked-out HEAD.
+ */
 export interface GroupChatHostRun {
   readonly pid: number;
   readonly commit: string;
@@ -82,9 +87,16 @@ export type GroupChatCommand =
       readonly path: RosterPath;
       readonly residentId: ResidentId;
     }
-  | { readonly kind: "plain-text-mention"; readonly roomId: string; readonly body: string }
+  | {
+      readonly kind: "plain-text-mention";
+      /** Judge-issued id; the host keeps exactly one routing decision per operation. */
+      readonly operationId: string;
+      readonly roomId: string;
+      readonly body: string;
+    }
   | {
       readonly kind: "structured-mention";
+      readonly operationId: string;
       readonly roomId: string;
       readonly targetId: string;
       readonly body: string;
@@ -124,6 +136,8 @@ export type GroupChatCommand =
 export interface RoomEvent {
   readonly id: string;
   readonly roomId: string;
+  /** Unique, increasing position in this room's ledger, assigned by the host on record. */
+  readonly position: number;
   readonly authorId: string;
   readonly body: string;
   readonly visibility: "public" | "hidden";
@@ -145,12 +159,19 @@ export interface RosterProjection {
   readonly residentIds: readonly ResidentId[];
   readonly humanIds: readonly string[];
 }
-export interface RouteRecord {
-  readonly marker: string;
-  readonly calls: number;
+/** The host's routing decision for one judge operation, with a stable reason code. */
+export interface MentionDecision {
+  readonly operationId: string;
+  readonly outcome: "accepted" | "rejected" | "held";
+  readonly reason: string;
   readonly targetId: string | null;
-  readonly rejected: boolean;
-  readonly gateBypassed: boolean;
+  /** Receipts this decision produced in the host-owned call ledger. */
+  readonly callReceiptIds: readonly string[];
+}
+/** One entry per resident call the host actually made. */
+export interface CallReceipt {
+  readonly id: string;
+  readonly targetId: string;
 }
 export interface SystemReceipt {
   readonly actor: "system" | ResidentId;
@@ -165,6 +186,8 @@ export interface ContextCommit {
 }
 export interface SurfaceSnapshot {
   readonly body: string;
+  /** Ledger event ids this viewer's projection of the room includes. */
+  readonly visibleEventIds: readonly string[];
   readonly candidates: readonly string[];
   readonly count: number;
   readonly errorCode: string | null;
@@ -188,6 +211,28 @@ export interface GroupChatRosterWorldEvidence {
   readonly rosterResidentIdsAfter: readonly ResidentId[];
   readonly residentIdsByPath: Readonly<Record<RosterPath, readonly ResidentId[]>>;
   readonly humanRenderedAsResident: boolean;
+}
+
+/** What the judge requires of the routing decision for one GC-05 operation. */
+export type GroupChatMentionExpectation = "text-only" | "route" | "reject" | "gate-closed";
+export interface GroupChatMentionOperation {
+  readonly operationId: string;
+  readonly expect: GroupChatMentionExpectation;
+}
+
+/** GC-15, one world: what a newcomer without a history grant sees around its join. */
+export interface GroupChatNewcomerHistoryEvidence {
+  /** Room positions of the judge's own posts, in the order the judge made them. */
+  readonly judgePostPositions: readonly (number | null)[];
+  readonly positionsUnique: boolean;
+  /** Public room events at or below the high-water mark read just before the join. */
+  readonly preJoinEventIds: readonly string[];
+  /** Public room events above the high-water mark read just after the join. */
+  readonly postJoinEventIds: readonly string[];
+  readonly roomPublicEventIds: readonly string[];
+  readonly visibleEventIds: readonly string[];
+  /** Judge-seeded pre-join bodies that still appear anywhere on the newcomer's surface. */
+  readonly preJoinTextOnSurface: readonly string[];
 }
 
 /** Judge-derived observations assembled from the readback APIs below. */
@@ -227,14 +272,14 @@ export interface GroupChatEvidenceById {
     sourceFilesWithRosterIdLiterals: readonly string[];
   };
   "GC-05": {
-    callsFromTextOnlyMentions: number;
-    targetsResolvedFromText: number;
+    operations: readonly GroupChatMentionOperation[];
+    /** Every decision read back; only those for the judge's operations are judged. */
+    decisions: readonly MentionDecision[];
+    /** Call-ledger entries that appeared during this scenario (read after minus read before). */
+    newCallReceipts: readonly CallReceipt[];
+    /** Ids of entries present before the scenario that vanished or changed afterwards. */
+    rewrittenCallReceiptIds: readonly string[];
     structuredTargetId: ResidentId;
-    routedResidentId: ResidentId | null;
-    legitimateStructuredRouteAccepted: boolean;
-    unknownTargetRejected: boolean;
-    unauthorizedTargetRejected: boolean;
-    turnOrStopGateBypassed: boolean;
   };
   "GC-09": {
     receipts: readonly SystemReceipt[];
@@ -253,8 +298,7 @@ export interface GroupChatEvidenceById {
     scopeReadSeedPresent: boolean;
     crossResidentScopeLeaks: readonly string[];
     scopeReadDenied: boolean;
-    newResidentSawPostJoinMessage: boolean;
-    newResidentReceivedHistoryByDefault: boolean;
+    newResidentHistory: readonly GroupChatNewcomerHistoryEvidence[];
     crossRoomReplayAccepted: boolean;
   };
 }
@@ -265,7 +309,9 @@ export interface GroupChatEvidenceById {
  */
 export interface GroupChatHostDriver {
   readonly kind: "mist-host";
+  /** Launch the host as a child process of this judge run (see GroupChatHostRun). */
   startHost(): Promise<GroupChatHostRun>;
+  /** Resolve only after the host process has exited; every readback must reject afterwards. */
   stopHost(): Promise<void>;
   resetScenario(id: GroupChatCheckId, fixture: typeof groupChatSyntheticFixture): Promise<void>;
   perform(command: GroupChatCommand): Promise<void>;
@@ -276,7 +322,8 @@ export interface GroupChatHostDriver {
   readResidentContext(residentId: ResidentId): Promise<string>;
   readRoster(): Promise<RosterSnapshot>;
   readRosterPath(path: RosterPath): Promise<RosterProjection>;
-  readRoutes(): Promise<readonly RouteRecord[]>;
+  readMentionDecisions(): Promise<readonly MentionDecision[]>;
+  readCallLedger(): Promise<readonly CallReceipt[]>;
   readSystemReceipts(): Promise<readonly SystemReceipt[]>;
   readContextCommits(): Promise<readonly ContextCommit[]>;
   readSurface(roomId: string, viewerId: string): Promise<SurfaceSnapshot>;

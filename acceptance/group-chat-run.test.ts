@@ -1,6 +1,9 @@
+import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   type GroupChatJudgeContext,
@@ -12,6 +15,7 @@ import {
 } from "./group-chat-checks.ts";
 import {
   type AccessAudit,
+  type CallReceipt,
   type ContextCommit,
   type DeliveryRecord,
   GROUP_CHAT_CHECK_IDS,
@@ -19,21 +23,26 @@ import {
   type GroupChatCommand,
   type GroupChatHostDriver,
   type MemoryRecord,
+  type MentionDecision,
   type ResidentId,
   type ResidentReaction,
   type RoomEvent,
   type RosterPath,
   type RosterProjection,
   type RosterSnapshot,
-  type RouteRecord,
   type SurfaceSnapshot,
   type SystemReceipt,
   cloneGroupChatDriverBoundary,
   groupChatSyntheticFixture as fixture,
 } from "./group-chat-driver.ts";
 import {
+  type HostProcessInfo,
+  type HostProvenanceFacts,
   findSourceLiterals,
   hostProvenanceProblem,
+  hostStopProblem,
+  isRepoEntryFile,
+  readProcessInfo,
   missingDriverResults as runnerMissingDriverResults,
   scoreGroupChatResults,
 } from "./group-chat-run.ts";
@@ -73,10 +82,24 @@ interface TestOptions {
   readonly routePlainText?: boolean;
   readonly routeBareName?: boolean;
   readonly resolvePlainTextTarget?: boolean;
-  readonly omitPlainRows?: boolean;
-  readonly omitRefusedRows?: boolean;
+  readonly omitPlainDecisions?: boolean;
   readonly holdGatedMentions?: boolean;
   readonly acceptUnknownTargetWithoutCall?: boolean;
+  /** #202 second-review probes: calls the decisions do not account for. */
+  readonly plainCallOffDecision?: boolean;
+  readonly orphanCalls?: boolean;
+  readonly gatedCallsWithoutDecision?: boolean;
+  readonly heldButCalled?: boolean;
+  readonly phantomReceipt?: boolean;
+  readonly wrongTargetReceipt?: boolean;
+  readonly duplicateDecision?: boolean;
+  readonly blankReason?: boolean;
+  readonly preexistingCall?: boolean;
+  readonly rewriteLedger?: boolean;
+  readonly newcomerSurfaceIncludesRoomBody?: boolean;
+  readonly newcomerSeesPreJoinIds?: boolean;
+  readonly newcomerMissesPostJoin?: boolean;
+  readonly duplicatePositions?: boolean;
 }
 
 /** Test-only host model; production runner never imports this adapter. */
@@ -94,7 +117,9 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   private joinedAt = new Map<ResidentId, number>();
   private rosterVersion = 1;
   private projections = new Map<RosterPath, RosterProjection>();
-  private routes: RouteRecord[] = [];
+  private decisions: MentionDecision[] = [];
+  private callLedger: CallReceipt[] = [];
+  private callCounter = 0;
   private receipts: SystemReceipt[] = [];
   private commits: ContextCommit[] = [];
   private reactions: ResidentReaction[] = [];
@@ -128,7 +153,12 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     ]);
     this.rosterVersion = 1;
     this.projections.clear();
-    this.routes = [];
+    this.decisions = [];
+    // A durable ledger may survive a scenario reset; the judge must only count its own window.
+    this.callLedger = this.options.preexistingCall
+      ? [{ id: "call:before-scenario", targetId: fixture.residentIds.a }]
+      : [];
+    this.callCounter = 0;
     this.receipts = [];
     this.commits = [];
     this.reactions = [];
@@ -140,12 +170,26 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   }
 
   /** Per-room event ids: a global counter would itself reveal hidden-room traffic (GC-15). */
-  private addEvent(event: Omit<RoomEvent, "id">): void {
+  private addEvent(event: Omit<RoomEvent, "id" | "position">): void {
     const next = (this.roomCounters.get(event.roomId) ?? 0) + 1;
     this.roomCounters.set(event.roomId, next);
     const id = `event:${event.roomId}#${next}`;
     this.eventTime.set(id, this.clock++);
-    this.events.push({ ...event, id });
+    this.events.push({ ...event, id, position: this.options.duplicatePositions ? 1 : next });
+  }
+
+  private call(targetId: string): string {
+    this.callCounter += 1;
+    const id = `call:${this.callCounter}`;
+    this.callLedger.push({ id, targetId });
+    return id;
+  }
+
+  private decide(decision: MentionDecision): void {
+    const recorded = this.options.blankReason ? { ...decision, reason: "" } : decision;
+    this.decisions.push(recorded);
+    if (this.options.duplicateDecision && decision.outcome === "accepted")
+      this.decisions.push({ ...recorded });
   }
 
   async perform(command: GroupChatCommand): Promise<void> {
@@ -236,53 +280,75 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
         return;
       }
       case "plain-text-mention": {
-        if (this.options.omitPlainRows) return;
-        const marker = command.body.split(/\s/u)[0] ?? "";
+        if (this.options.omitPlainDecisions) return;
         const target = fixture.residentIds.b;
         const bareName = command.body.replaceAll(`@${target}`, "").includes(target);
         const routed =
           this.options.routePlainText === true || (this.options.routeBareName === true && bareName);
-        this.routes.push({
-          marker,
-          calls: routed ? 1 : 0,
-          targetId: this.options.resolvePlainTextTarget ? target : null,
-          rejected: false,
-          gateBypassed: false,
+        // Review probe: the call happens, but this operation's decision does not cite it.
+        if (this.options.plainCallOffDecision) this.call(target);
+        this.decide({
+          operationId: command.operationId,
+          outcome: routed ? "accepted" : "rejected",
+          reason: routed ? "text-mention" : "no-structured-target",
+          targetId: routed || this.options.resolvePlainTextTarget ? target : null,
+          callReceiptIds: routed ? [this.call(target)] : [],
         });
         return;
       }
       case "structured-mention": {
         const validTarget = [...this.roster].includes(command.targetId as ResidentId);
         const gateClosed = this.gateStopped || !this.gateTurnOpen;
+        const operationId = command.operationId;
+        if (this.options.rewriteLedger)
+          this.callLedger = this.callLedger.filter(({ id }) => id !== "call:before-scenario");
+        // Review probe: calls made while the gate is closed, with no decision at all.
+        if (gateClosed && this.options.gatedCallsWithoutDecision) {
+          this.call(command.targetId);
+          return;
+        }
         if (!validTarget && !gateClosed && this.options.acceptUnknownTargetWithoutCall) {
-          this.routes.push({
-            marker: command.body,
-            calls: 0,
+          this.decide({
+            operationId,
+            outcome: "accepted",
+            reason: "unchecked-target",
             targetId: command.targetId,
-            rejected: false,
-            gateBypassed: false,
+            callReceiptIds: [],
           });
           return;
         }
-        if (gateClosed && validTarget && this.options.holdGatedMentions) {
-          this.routes.push({
-            marker: command.body,
-            calls: 0,
+        if (
+          gateClosed &&
+          validTarget &&
+          (this.options.holdGatedMentions || this.options.heldButCalled)
+        ) {
+          if (this.options.heldButCalled) this.call(command.targetId);
+          this.decide({
+            operationId,
+            outcome: "held",
+            reason: "gate-closed",
             targetId: command.targetId,
-            rejected: false,
-            gateBypassed: false,
+            callReceiptIds: [],
           });
           return;
         }
         const rejected = gateClosed || !validTarget || this.options.deadRouter === true;
-        const bypassed = gateClosed && this.options.bypassGate === true;
-        if (rejected && !bypassed && this.options.omitRefusedRows) return;
-        this.routes.push({
-          marker: command.body,
-          calls: rejected && !bypassed ? 0 : 1,
+        const calls = !rejected || (gateClosed && this.options.bypassGate === true);
+        // Review probe: extra calls outside every decision (the NOT-A-JUDGE-MARKER rows).
+        if (calls && !gateClosed && this.options.orphanCalls)
+          for (let extra = 0; extra < 5; extra += 1) this.call(command.targetId);
+        let callReceiptIds: string[] = [];
+        if (calls && this.options.phantomReceipt) callReceiptIds = ["call:never-made"];
+        else if (calls)
+          callReceiptIds = [
+            this.call(this.options.wrongTargetReceipt ? fixture.residentIds.a : command.targetId),
+          ];
+        this.decide({
+          operationId,
+          outcome: calls ? "accepted" : "rejected",
+          reason: calls ? "structured-target" : gateClosed ? "gate-closed" : "invalid-target",
           targetId: validTarget ? command.targetId : null,
-          rejected: rejected && !bypassed,
-          gateBypassed: bypassed,
+          callReceiptIds,
         });
         return;
       }
@@ -431,8 +497,11 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
   async readRosterPath(path: RosterPath): Promise<RosterProjection> {
     return this.projections.get(path) ?? { residentIds: [], humanIds: [] };
   }
-  async readRoutes(): Promise<readonly RouteRecord[]> {
-    return this.routes;
+  async readMentionDecisions(): Promise<readonly MentionDecision[]> {
+    return this.decisions;
+  }
+  async readCallLedger(): Promise<readonly CallReceipt[]> {
+    return this.callLedger;
   }
   async readSystemReceipts(): Promise<readonly SystemReceipt[]> {
     return this.receipts;
@@ -444,10 +513,18 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
     const room = this.rooms.get(roomId);
     if (room?.visibility === "hidden" && viewerId !== fixture.humanId) {
       if (this.options.leakHiddenToUnauthorized) {
-        return { body: room.body, candidates: [], count: 1, errorCode: null, receipt: null };
+        return {
+          body: room.body,
+          visibleEventIds: [],
+          candidates: [],
+          count: 1,
+          errorCode: null,
+          receipt: null,
+        };
       }
       return {
         body: "",
+        visibleEventIds: [],
         candidates: [],
         count: 0,
         errorCode: this.options.revealHiddenExistence ? "forbidden" : "not-found",
@@ -455,21 +532,27 @@ class SyntheticGroupChatHost implements GroupChatHostDriver {
       };
     }
     // A resident sees room history from its join time; the owner and outsiders keep the
-    // pre-existing all-public view.
+    // all-public view. Residents a and b joined at 0, before anything was recorded.
     const joined = this.options.newResidentGetsHistory
       ? undefined
       : this.joinedAt.get(viewerId as ResidentId);
-    const visibleEvents = this.events.filter(
-      (event) =>
-        event.roomId === roomId &&
-        event.visibility === "public" &&
-        (joined === undefined || (this.eventTime.get(event.id) ?? 0) >= joined),
+    const newcomer = joined !== undefined && joined > 0;
+    const roomPublic = this.events.filter(
+      (event) => event.roomId === roomId && event.visibility === "public",
     );
-    const body = [room?.body, ...visibleEvents.map((event) => event.body)]
-      .filter((value): value is string => Boolean(value))
-      .join("\n");
+    const visibleEvents =
+      newcomer && this.options.newcomerMissesPostJoin
+        ? []
+        : roomPublic.filter(
+            (event) => joined === undefined || (this.eventTime.get(event.id) ?? 0) >= joined,
+          );
+    const bodies = visibleEvents.map((event) => event.body);
+    // Review probe: the room's seed body glued onto a newcomer's surface outside the event list.
+    if (newcomer && room && this.options.newcomerSurfaceIncludesRoomBody) bodies.unshift(room.body);
+    const listed = newcomer && this.options.newcomerSeesPreJoinIds ? roomPublic : visibleEvents;
     return {
-      body: this.options.publicBodyX && roomId === fixture.roomId ? "x" : body,
+      body: this.options.publicBodyX && roomId === fixture.roomId ? "x" : bodies.join("\n"),
+      visibleEventIds: listed.map(({ id }) => id),
       candidates: visibleEvents.map(({ id }) => id),
       count: visibleEvents.length,
       errorCode: room ? null : "not-found",
@@ -518,6 +601,22 @@ const unsupportedClaims = [
   "记住了",
   "已写入记忆",
   "写入了长期记忆",
+  // #202 second review: plain synonyms that slipped through, and 👀 under a denial span.
+  "成员看见消息了",
+  "成员看过这条消息",
+  "住户记得这条",
+  "成员阅读了消息",
+  "对方在打字",
+  "系统写入记忆",
+  "不代表理解👀",
+  "不是未读是已读",
+  "member saw the message",
+  // Clause and subject edges that must stay red.
+  "系统：已读",
+  "系统代发已读",
+  "已读但不代表理解",
+  "成员已经看过并理解了",
+  "已装入，不代表成员已读👀",
 ];
 
 /**
@@ -553,6 +652,14 @@ const honestClaims = [
   "系统不发送👀",
   "系统已读取配置",
   "以 read-only 方式装入",
+  // #202 second review: the system's own reading, misread as a member's.
+  "已读完配置",
+  "系统已看到投递失败",
+  "系统读了配置",
+  "查看过程日志",
+  "成员没看过",
+  "成员不记得",
+  "待写入记忆",
 ];
 
 describe("#191 group-chat acceptance: judge-driven synthetic host checks", () => {
@@ -596,6 +703,16 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ["GC-05", { resolvePlainTextTarget: true }, "解析成了呼叫目标"],
     ["GC-05", { deadRouter: true }, "恰好路由一次"],
     ["GC-05", { acceptUnknownTargetWithoutCall: true }, "未知或越权目标"],
+    ["GC-05", { omitPlainDecisions: true }, "缺 8 条"],
+    ["GC-05", { plainCallOffDecision: true }, "不对应任何刺激"],
+    ["GC-05", { orphanCalls: true }, "不对应任何刺激"],
+    ["GC-05", { gatedCallsWithoutDecision: true }, "缺 2 条"],
+    ["GC-05", { heldButCalled: true }, "不对应任何刺激"],
+    ["GC-05", { phantomReceipt: true }, "呼叫账里没有的回执"],
+    ["GC-05", { wrongTargetReceipt: true }, "未路由到正确住户"],
+    ["GC-05", { duplicateDecision: true }, "重复 1 条"],
+    ["GC-05", { blankReason: true }, "原因码"],
+    ["GC-05", { preexistingCall: true, rewriteLedger: true }, "改写或删减"],
     ["GC-09", { contextCommitRef: "x" }, "提交引用"],
     ["GC-09", { publishFutureReceiptsEarly: true }, "提前出现"],
     ["GC-09", { proxyReaction: true }, "代发"],
@@ -610,6 +727,10 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     ["GC-15", { leakResidentScope: true }, "内部 scope"],
     ["GC-15", { silentScopeRead: true }, "恰好一次拒绝"],
     ["GC-15", { newResidentGetsHistory: true }, "入群前"],
+    ["GC-15", { newcomerSurfaceIncludesRoomBody: true }, "入群前"],
+    ["GC-15", { newcomerSeesPreJoinIds: true }, "入群前"],
+    ["GC-15", { newcomerMissesPostJoin: true }, "入群后看不到新消息"],
+    ["GC-15", { duplicatePositions: true }, "位置"],
   ] as const)("%s goes red for its own reason under %j", async (id, options, reason) => {
     const result = await check(id, options);
     expect(result.passed).toBe(false);
@@ -742,9 +863,27 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
     expect((await check("GC-05", { deadRouter: true })).passed).toBe(false);
   });
 
-  it("treats a missing route row as zero calls (the review's empty-routes probe)", async () => {
-    const result = await check("GC-05", { omitPlainRows: true, omitRefusedRows: true });
+  it("asks each operation for its own decision instead of reading a missing row as a call", async () => {
+    const result = await check("GC-05", { omitPlainDecisions: true });
+    expect(result.passed).toBe(false);
+    expect(result.detail).toContain("路由决定");
+    expect(result.detail).not.toContain("触发了调用");
+  });
+
+  it("counts only this scenario's window of a call ledger that survives resets", async () => {
+    const result = await check("GC-05", { preexistingCall: true });
     expect(result.passed, result.detail).toBe(true);
+  });
+
+  it("turns the #202 second review's off-marker and unrecorded calls red", async () => {
+    const probes: TestOptions[] = [
+      { plainCallOffDecision: true },
+      { orphanCalls: true },
+      { gatedCallsWithoutDecision: true },
+    ];
+    for (const probe of probes) {
+      expect((await check("GC-05", probe)).passed, JSON.stringify(probe)).toBe(false);
+    }
   });
 
   it("lets a closed gate hold a mention without calling it", async () => {
@@ -897,32 +1036,141 @@ describe("#191 group-chat acceptance: judge-driven synthetic host checks", () =>
 
 describe("#191 runner: real-host provenance and static source scan", () => {
   const head = "0123456789abcdef0123456789abcdef01234567";
-  const alive = () => true;
+  const judgePid = 4242;
+  const node = "/opt/test-node/bin/node";
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const entry = join("src", "installer", "cli.ts");
+  const hostProcess = (overrides: Partial<HostProcessInfo> = {}): HostProcessInfo => ({
+    alive: true,
+    ancestors: [judgePid, 1],
+    executable: node,
+    args: [node, "--import", "tsx", entry],
+    ...overrides,
+  });
+  const facts = (info: HostProcessInfo | null): HostProvenanceFacts => ({
+    headCommit: head,
+    judgePid,
+    judgeExecutable: node,
+    repoRoot,
+    readProcess: () => info,
+  });
 
   it("rejects the synthetic host's self-report even though it is typed mist-host", async () => {
     const run = await new SyntheticGroupChatHost().startHost();
-    expect(hostProvenanceProblem(run, { headCommit: head, isProcessAlive: () => false })).toMatch(
-      /not running/,
+    expect(hostProvenanceProblem(run, facts(null))).toMatch(/not running/);
+    expect(hostProvenanceProblem(run, facts(hostProcess({ ancestors: [1] })))).toMatch(
+      /not started by this judge run/,
     );
-    expect(hostProvenanceProblem(run, { headCommit: head, isProcessAlive: alive })).toMatch(
-      /not a commit id/,
-    );
+    expect(hostProvenanceProblem(run, facts(hostProcess()))).toMatch(/not a commit id/);
   });
 
-  it("requires a live process and the checked-out HEAD commit", () => {
-    const facts = { headCommit: head, isProcessAlive: alive };
-    expect(hostProvenanceProblem({ pid: process.pid, commit: head }, facts)).toBeNull();
-    expect(
-      hostProvenanceProblem({ pid: process.pid, commit: head.slice(0, 12) }, facts),
-    ).toBeNull();
-    expect(hostProvenanceProblem({ pid: process.pid, commit: "fedcba9876" }, facts)).toMatch(
+  it("accepts a live child of the judge running its node on a src/ entry at HEAD", () => {
+    const child = facts(hostProcess());
+    expect(hostProvenanceProblem({ pid: 5000, commit: head }, child)).toBeNull();
+    expect(hostProvenanceProblem({ pid: 5000, commit: head.slice(0, 12) }, child)).toBeNull();
+    expect(hostProvenanceProblem({ pid: 5000, commit: "fedcba9876" }, child)).toMatch(
       /not the checked-out HEAD/,
     );
-    expect(hostProvenanceProblem({ pid: process.pid, commit: "012345" }, facts)).toMatch(
+    expect(hostProvenanceProblem({ pid: 5000, commit: "012345" }, child)).toMatch(
       /not a commit id/,
     );
-    expect(hostProvenanceProblem({ pid: 0, commit: head }, facts)).toMatch(/valid process id/);
+    expect(hostProvenanceProblem({ pid: 0, commit: head }, child)).toMatch(/valid process id/);
   });
+
+  // The #202 second review passed provenance with borrowed live pids and the current HEAD.
+  it.each([
+    [
+      "the judge's own pid",
+      judgePid,
+      hostProcess({ ancestors: [1] }),
+      /not started by this judge run/,
+    ],
+    ["pid 1", 1, hostProcess({ ancestors: [] }), /not started by this judge run/],
+    [
+      "a stray sleep",
+      7000,
+      hostProcess({
+        ancestors: [6999, 1],
+        executable: "/usr/bin/sleep",
+        args: ["sleep", "600"],
+      }),
+      /not started by this judge run/,
+    ],
+    [
+      "a sleep child",
+      7001,
+      hostProcess({ executable: "/usr/bin/sleep", args: ["sleep", "600"] }),
+      /not this judge's node/,
+    ],
+    [
+      "an idle node -e child",
+      7002,
+      hostProcess({ args: [node, "-e", "setInterval(() => {}, 1e9)"] }),
+      /no entry file/,
+    ],
+    [
+      "a node child running only the judge",
+      7003,
+      hostProcess({ args: [node, "acceptance/group-chat-run.ts"] }),
+      /no entry file/,
+    ],
+    ["a zombie child", 7004, hostProcess({ alive: false }), /not running/],
+  ] as const)("rejects %s even with the current HEAD", (_label, pid, info, reason) => {
+    expect(hostProvenanceProblem({ pid, commit: head }, facts(info))).toMatch(reason);
+  });
+
+  it("counts only an existing non-test source file under src/ as the host entry", () => {
+    expect(isRepoEntryFile(entry, repoRoot)).toBe(true);
+    expect(isRepoEntryFile(join(repoRoot, entry), repoRoot)).toBe(true);
+    expect(isRepoEntryFile("acceptance/group-chat-run.ts", repoRoot)).toBe(false);
+    expect(isRepoEntryFile("src/not-a-real-entry.ts", repoRoot)).toBe(false);
+    expect(isRepoEntryFile("src/installer", repoRoot)).toBe(false);
+    expect(isRepoEntryFile("--import=tsx", repoRoot)).toBe(false);
+    expect(isRepoEntryFile("../outside/src/host.ts", repoRoot)).toBe(false);
+  });
+
+  it("requires the host process gone and readbacks refused after stopHost()", async () => {
+    const refusing = {
+      readRoomEvents: async (): Promise<readonly RoomEvent[]> => {
+        throw new Error("host stopped");
+      },
+    };
+    const answering = { readRoomEvents: async (): Promise<readonly RoomEvent[]> => [] };
+    expect(await hostStopProblem(refusing, 5000, () => null)).toBeNull();
+    expect(await hostStopProblem(refusing, 5000, () => hostProcess({ alive: false }))).toBeNull();
+    expect(await hostStopProblem(refusing, 5000, () => hostProcess())).toMatch(/still running/);
+    expect(await hostStopProblem(answering, 5000, () => null)).toMatch(/still answered/);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reads a real child's liveness, parents, binary and argv, and forgets it after exit",
+    async () => {
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        stdio: "ignore",
+      });
+      const pid = child.pid ?? -1;
+      try {
+        const vias = process.platform === "linux" ? (["proc", "ps"] as const) : (["ps"] as const);
+        for (const via of vias) {
+          const info = readProcessInfo(pid, via);
+          expect(info?.alive, via).toBe(true);
+          expect(info?.ancestors, via).toContain(process.pid);
+          expect(info?.args?.[1], via).toBe("-e");
+        }
+        if (process.platform === "linux")
+          expect(readProcessInfo(pid, "proc")?.executable).toBe(realpathSync(process.execPath));
+      } finally {
+        const exited = new Promise((done) => child.once("exit", done));
+        child.kill();
+        await exited;
+      }
+      expect(readProcessInfo(pid)).toBeNull();
+    },
+  );
+
+  it.todo(
+    "writes a durable challenge straight into the host's room ledger and reads it back through the adapter (needs the #191 adapter's data-root contract)",
+  );
 
   it("finds member-id literals only in non-test source files", async () => {
     const root = await mkdtemp(join(tmpdir(), "gc04-scan-"));

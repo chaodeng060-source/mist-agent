@@ -6,13 +6,17 @@
  *
  * A missing adapter is a known red baseline, never a green or host test result.
  * `kind: "mist-host"` is only a type tag: before any lamp runs, the host's own report is
- * checked against facts the judge reads itself (a live process, the current HEAD commit).
+ * checked against facts the judge reads itself — the pid is a live descendant of this judge
+ * process running the same node binary with an entry file from this checkout's src/, and the
+ * commit is the checked-out HEAD. After stopHost() the process must be gone and readbacks must
+ * reject. These checks stop lazy stand-ins; a judge-written durable challenge proving that
+ * readbacks come from the host's own ledger waits for the #191 adapter's data-root contract.
  * STUBBED follows the repo's acceptance convention: declared methods turn a lamp yellow.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { groupChatChecks, runGroupChatCheck } from "./group-chat-checks.ts";
 import {
@@ -56,15 +60,32 @@ export function missingDriverResults(): GroupChatRunResult[] {
   }));
 }
 
+/** What the judge reads about a process itself: Linux /proc, other POSIX systems `ps`. */
+export interface HostProcessInfo {
+  /** Present and not a zombie. */
+  readonly alive: boolean;
+  /** Parent chain as far as the judge could read it, nearest first. */
+  readonly ancestors: readonly number[];
+  /** Resolved path of the running binary, or null if unreadable. */
+  readonly executable: string | null;
+  /** argv including argv[0], or null if unreadable. */
+  readonly args: readonly string[] | null;
+}
+
 export interface HostProvenanceFacts {
   readonly headCommit: string;
-  readonly isProcessAlive: (pid: number) => boolean;
+  readonly judgePid: number;
+  /** Resolved path of the node binary running this judge. */
+  readonly judgeExecutable: string;
+  readonly repoRoot: string;
+  readonly readProcess: (pid: number) => HostProcessInfo | null;
 }
 
 /**
- * Checks the host's self-reported run against judge-read facts. Returns the reason it is not
- * acceptable as real-host evidence, or null. A synthetic fixture (made-up pid, placeholder
- * commit) fails here even if it calls itself "mist-host".
+ * Checks the host's self-reported run against facts the judge reads itself. Returns the reason
+ * it is not acceptable as real-host evidence, or null. A synthetic fixture (made-up pid,
+ * placeholder commit) fails here even if it calls itself "mist-host", and so does a borrowed
+ * live pid: the judge's own, pid 1, a stray sleep, or an idle node child with no entry file.
  */
 export function hostProvenanceProblem(
   run: GroupChatHostRun,
@@ -72,7 +93,14 @@ export function hostProvenanceProblem(
 ): string | null {
   if (!Number.isSafeInteger(run.pid) || run.pid <= 0)
     return "host did not report a valid process id";
-  if (!facts.isProcessAlive(run.pid)) return `host process ${run.pid} is not running`;
+  const info = facts.readProcess(run.pid);
+  if (info === null || !info.alive) return `host process ${run.pid} is not running`;
+  if (run.pid === facts.judgePid || !info.ancestors.includes(facts.judgePid))
+    return `host process ${run.pid} was not started by this judge run (not a descendant of pid ${facts.judgePid})`;
+  if (info.executable !== facts.judgeExecutable)
+    return `host process ${run.pid} runs ${info.executable ?? "an unreadable binary"}, not this judge's node ${facts.judgeExecutable}`;
+  if (info.args === null || !info.args.slice(1).some((arg) => isRepoEntryFile(arg, facts.repoRoot)))
+    return `host process ${run.pid} command line names no entry file under src/ in this checkout`;
   const commit = run.commit.trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/u.test(commit)) return `host source "${run.commit}" is not a commit id`;
   if (!facts.headCommit.trim().toLowerCase().startsWith(commit))
@@ -80,22 +108,106 @@ export function hostProvenanceProblem(
   return null;
 }
 
+/**
+ * After stopHost() resolves, the host process must be gone and readbacks must fail: an adapter
+ * that still answers is serving its own copy, not the host process it reported.
+ */
+export async function hostStopProblem(
+  driver: Pick<GroupChatHostDriver, "readRoomEvents">,
+  pid: number,
+  readProcess: (pid: number) => HostProcessInfo | null,
+): Promise<string | null> {
+  if (readProcess(pid)?.alive === true)
+    return `host process ${pid} is still running after stopHost()`;
+  try {
+    await driver.readRoomEvents();
+  } catch {
+    return null;
+  }
+  return "readRoomEvents() still answered after stopHost(), so readbacks do not come from the host process";
+}
+
 function currentHeadCommit(): string {
   return execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim();
 }
 
-function processIsAlive(pid: number): boolean {
+function attempt<T>(read: () => T): T | null {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return read();
+  } catch {
+    return null;
   }
+}
+
+function linuxStat(pid: number): { readonly state: string; readonly ppid: number } | null {
+  const stat = attempt(() => readFileSync(`/proc/${pid}/stat`, "utf8"));
+  if (stat === null) return null;
+  // The command name may contain spaces or parentheses; the fixed fields follow the last ")".
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  return { state: fields[0] ?? "", ppid: Number(fields[1]) };
+}
+
+function psField(pid: number, field: string): string | null {
+  return attempt(() =>
+    execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8" }).trim(),
+  );
+}
+
+function ancestorsOf(pid: number, parentOf: (child: number) => number): number[] {
+  const ancestors: number[] = [];
+  let parent = parentOf(pid);
+  while (Number.isSafeInteger(parent) && parent > 0 && ancestors.length < 64) {
+    ancestors.push(parent);
+    parent = parentOf(parent);
+  }
+  return ancestors;
+}
+
+/** Reads a process through /proc (Linux) or `ps` (other POSIX); null when it is not there. */
+export function readProcessInfo(
+  pid: number,
+  via: "proc" | "ps" = process.platform === "linux" ? "proc" : "ps",
+): HostProcessInfo | null {
+  if (via === "proc") {
+    const stat = linuxStat(pid);
+    if (stat === null) return null;
+    return {
+      alive: stat.state !== "Z" && stat.state !== "X",
+      ancestors: ancestorsOf(pid, (child) => linuxStat(child)?.ppid ?? 0),
+      executable: attempt(() => realpathSync(readlinkSync(`/proc/${pid}/exe`))),
+      args: attempt(() =>
+        readFileSync(`/proc/${pid}/cmdline`, "utf8")
+          .split("\0")
+          .filter((arg) => arg !== ""),
+      ),
+    };
+  }
+  const state = psField(pid, "stat");
+  if (state === null || state === "") return null;
+  const command = psField(pid, "comm");
+  return {
+    alive: !state.startsWith("Z"),
+    ancestors: ancestorsOf(pid, (child) => Number(psField(child, "ppid") ?? 0)),
+    executable: command === null ? null : (attempt(() => realpathSync(command)) ?? command),
+    args: psField(pid, "args")?.split(/\s+/u) ?? null,
+  };
 }
 
 const SOURCE_FILE = /\.[cm]?[jt]sx?$/u;
 const TEST_FILE = /\.(?:test|spec)\.[cm]?[jt]sx?$/u;
 const SKIPPED_DIRECTORIES = new Set(["node_modules", "__tests__", "test", "tests"]);
+
+/**
+ * A command-line argument that names an existing non-test source file under this checkout's
+ * src/: the host's own entry, not the judge, a dependency, or code outside the checkout.
+ */
+export function isRepoEntryFile(arg: string, repoRoot: string): boolean {
+  if (arg.startsWith("-")) return false;
+  const inside = relative(repoRoot, resolve(repoRoot, arg));
+  if (!inside.startsWith(`src${sep}`) || inside.split(sep).includes("node_modules")) return false;
+  if (!SOURCE_FILE.test(inside) || TEST_FILE.test(inside)) return false;
+  return attempt(() => statSync(join(repoRoot, inside)).isFile()) === true;
+}
 
 /**
  * GC-04 static half: non-test source files under `root` that spell out any of `terms`.
@@ -153,11 +265,15 @@ async function loadDriver(): Promise<LoadedDriver | null> {
 
 async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]> {
   const { driver, stubbed } = loaded;
-  const host = await driver.startHost();
-  const problem = hostProvenanceProblem(host, {
+  const facts: HostProvenanceFacts = {
     headCommit: currentHeadCommit(),
-    isProcessAlive: processIsAlive,
-  });
+    judgePid: process.pid,
+    judgeExecutable: realpathSync(process.execPath),
+    repoRoot: REPO_ROOT,
+    readProcess: (pid) => readProcessInfo(pid),
+  };
+  const host = await driver.startHost();
+  const problem = hostProvenanceProblem(host, facts);
   if (problem !== null) {
     await driver.stopHost();
     throw new Error(`real-host provenance check failed: ${problem}`);
@@ -192,7 +308,13 @@ async function runHostChecks(loaded: LoadedDriver): Promise<GroupChatRunResult[]
   } finally {
     await driver.stopHost();
   }
+  const stopProblem = await hostStopProblem(driver, host.pid, facts.readProcess);
+  if (stopProblem !== null)
+    throw new Error(`real-host provenance check failed after stopHost(): ${stopProblem}`);
   console.log(`真实宿主进程 PID ${host.pid}；代码 ${host.commit}`);
+  console.log(
+    "宿主来源已由判卷核对：判卷子进程、同一 node、src/ 入口、当前 HEAD、停机后进程退出且读回拒绝。判卷绕过 adapter 直写原账再读回的挑战，待 #191 adapter 定下数据根后补。",
+  );
   return results;
 }
 
